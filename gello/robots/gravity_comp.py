@@ -128,6 +128,8 @@ class GravityCompThread:
             self._driver.set_joints(current_pos.tolist())
         except Exception as e:
             print(f"[GravComp] 위치 초기화 실패: {e}")
+        finally:
+            self._driver.set_torque_mode(False)
 
         print("Gravity compensation stopped.")
 
