@@ -168,10 +168,6 @@ class LeRobotRecorder:
                     self.dataset.meta._flush_metadata_buffer()
                 except Exception as e:
                     print(f"[Recorder] meta flush warning: {e}")
-                try:
-                    self.dataset.meta._close_writer()
-                except Exception as e:
-                    print(f"[Recorder] meta writer close warning: {e}")
                 self._episode_count += 1
                 print(f"Saved. Total episodes: {self._episode_count}")
             except Exception as e:
