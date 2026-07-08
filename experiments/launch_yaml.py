@@ -1,10 +1,13 @@
 import atexit
+import faulthandler
 import signal
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, List, Optional
+
+faulthandler.enable()  # segfault 시 C 스택 트레이스 출력
 
 import tyro
 import zmq.error
@@ -12,9 +15,37 @@ from omegaconf import OmegaConf
 
 from gello.utils.launch_utils import instantiate_from_dict
 
+
+def compute_yellow_displacement(img_bgr):
+    """손목 카메라 이미지에서 노란색 물체의 중심 변위 (dx, dy) 반환.
+
+    반환값은 이미지 중심 기준으로 -1~1 정규화된 값.
+    노란색 물체가 검출되지 않으면 (0.0, 0.0) 반환.
+    """
+    import cv2 as _cv2
+    import numpy as _np2
+    hsv = _cv2.cvtColor(img_bgr, _cv2.COLOR_BGR2HSV)
+    # 노란색 HSV 범위
+    mask = _cv2.inRange(hsv, _np2.array([20, 80, 80]), _np2.array([35, 255, 255]))
+    mask = _cv2.erode(mask, None, iterations=2)
+    mask = _cv2.dilate(mask, None, iterations=2)
+    contours, _ = _cv2.findContours(mask, _cv2.RETR_EXTERNAL, _cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return 0.0, 0.0
+    c = max(contours, key=_cv2.contourArea)
+    M = _cv2.moments(c)
+    if M["m00"] == 0:
+        return 0.0, 0.0
+    cx = M["m10"] / M["m00"]
+    cy = M["m01"] / M["m00"]
+    h, w = img_bgr.shape[:2]
+    dx = (cx - w / 2) / (w / 2)
+    dy = (cy - h / 2) / (h / 2)
+    return float(dx), float(dy)
+
 # Global variables for cleanup
-active_threads = []
-active_servers = []
+active_threads: List[threading.Thread] = []
+active_servers: List[Any] = []
 cleanup_in_progress = False
 
 
@@ -71,9 +102,6 @@ class Args:
     right_config_path: Optional[str] = None
     """Path to the right arm configuration YAML file (for bimanual operation)."""
 
-    use_save_interface: bool = False
-    """Enable saving data with keyboard interface."""
-
 
 def signal_handler(signum, frame):
     """Handle shutdown signals gracefully."""
@@ -99,6 +127,7 @@ def main():
     left_cfg = OmegaConf.to_container(
         OmegaConf.load(args.left_config_path), resolve=True
     )
+    right_cfg = None
     if bimanual:
         right_cfg = OmegaConf.to_container(
             OmegaConf.load(args.right_config_path), resolve=True
@@ -123,6 +152,21 @@ def main():
         )
 
     left_robot = instantiate_from_dict(left_robot_cfg)
+
+    # Read launch parameters from YAML
+    gripper_port   = left_cfg.get("gripper_port")
+    gc_cfg         = left_cfg.get("gravity_comp", {})
+    dataset_cfg    = left_cfg.get("dataset", {})
+    vla_cfg        = left_cfg.get("vla", {})
+
+    # Create one shared DATCGripper instance and inject into robot
+    gripper = None
+    if gripper_port:
+        from gello.robots.datc_gripper import DATCGripper
+        gripper = DATCGripper(port=gripper_port)
+        if hasattr(left_robot, "_datc_gripper"):
+            left_robot._datc_gripper = gripper
+            left_robot._use_gripper = True
 
     if bimanual:
         from gello.robots.robot import BimanualRobot
@@ -149,8 +193,8 @@ def main():
         from gello.zmq_core.robot_node import ZMQClientRobot
 
         # Get server configuration
-        server_port = cfg["robot"].get("port", 5556)
-        server_host = cfg["robot"].get("host", "127.0.0.1")
+        server_port = cfg["robot"].get("port", 5556)  # type: ignore[union-attr]
+        server_host = cfg["robot"].get("host", "127.0.0.1")  # type: ignore[union-attr]
 
         # Start server in background (non-daemon for proper cleanup)
         server_thread = threading.Thread(target=robot.serve, daemon=False)
@@ -204,24 +248,309 @@ def main():
     else:
         move_to_start_position(env, bimanual, left_cfg)
 
+    # ── 2π 오프셋 자동 보정 (Dynamixel 초기 읽기 안정화 후 실행) ──────
+    import numpy as _np2
+    import time as _time2
+    _gello_robot = getattr(agent, "_robot", None)
+    if _gello_robot is not None:
+        try:
+            _time2.sleep(0.5)  # Dynamixel background thread 안정화 대기
+            _ur_joints  = _np2.array(env.get_obs()["joint_positions"][:6])
+            _gello_joints = _gello_robot.get_joint_state()[:6]
+            # 비정상적으로 큰 값이면 AutoCorrect 건너뜀 (garbage 읽기 방지)
+            if _np2.any(_np2.abs(_gello_joints) > 30.0):
+                print(f"[AutoCorrect] GELLO 값이 비정상 (max={_np2.max(_np2.abs(_gello_joints)):.1f} rad) → 건너뜀")
+            else:
+                _changed = False
+                for _i in range(6):
+                    _diff = _gello_joints[_i] - _ur_joints[_i]
+                    _n = round(_diff / (2 * _np2.pi))
+                    if abs(_n) >= 1 and abs(_diff - _n * 2 * _np2.pi) < 0.3:
+                        _gello_robot._joint_offsets[_i] -= _n * 2 * _np2.pi
+                        print(f"[AutoCorrect] Joint {_i+1}: {_n*360:+.0f}° 보정됨")
+                        _changed = True
+                if _changed:
+                    _new_offsets = _gello_robot._joint_offsets[:6].tolist()
+                    import re
+                    with open(args.left_config_path, "r") as _f:
+                        _yaml_str = _f.read()
+                    _fmt = "[" + ", ".join(f"{v:.4f}" for v in _new_offsets) + "]"
+                    _yaml_str = re.sub(r"joint_offsets:\s*\[.*?\]", f"joint_offsets: {_fmt}", _yaml_str)
+                    with open(args.left_config_path, "w") as _f:
+                        _f.write(_yaml_str)
+                    print(f"[AutoCorrect] YAML 저장 완료: {_fmt}")
+                else:
+                    print("[AutoCorrect] 2π 오프셋 이상 없음.")
+        except Exception as _e:
+            print(f"[AutoCorrect] 건너뜀: {_e}")
+
     print(
         f"Launching robot: {robot.__class__.__name__}, agent: {agent.__class__.__name__}"
     )
     print(f"Control loop: {cfg.get('hz', 30)} Hz")
 
-    from gello.utils.control_utils import SaveInterface, run_control_loop
+    from gello.ui.control_panel import ControlPanel
 
-    # Initialize save interface if requested
-    save_interface = None
-    if args.use_save_interface:
-        save_interface = SaveInterface(
-            data_dir=Path(args.left_config_path).parents[1] / "data",
-            agent_name=agent.__class__.__name__,
-            expand_user=True,
+    # LeRobot recorder (카메라 없이도 state/action 저장 가능)
+    recorder = None
+    cameras = {}
+    if dataset_cfg.get("dir"):
+        from gello.data_utils.lerobot_recorder import LeRobotRecorder, make_lerobot_dataset
+        from gello.cameras.realsense_camera import get_device_ids, RealSenseCamera
+
+        device_ids = get_device_ids()
+        if len(device_ids) >= 2:
+            cameras = {
+                "exterior": RealSenseCamera(device_id=device_ids[0]),
+                "wrist":    RealSenseCamera(device_id=device_ids[1]),
+            }
+        elif len(device_ids) == 1:
+            cameras = {"wrist": RealSenseCamera(device_id=device_ids[0])}
+
+        # state = joint_pos(7) + joint_vel(6) + gripper(1) + yellow_dx(1) + yellow_dy(1) = 16
+        STATE_DIM  = left_robot.num_dofs() + 6 + 1 + 2
+        ACTION_DIM = left_robot.num_dofs()
+        dataset = make_lerobot_dataset(
+            repo_id=dataset_cfg.get("repo_id", "koras/ur10_task"),
+            root=str(Path(dataset_cfg["dir"]).expanduser()),
+            fps=int(cfg.get("hz", 30)),
+            state_dim=STATE_DIM,
+            action_dim=ACTION_DIM,
+            camera_keys=list(cameras.keys()),
+        )
+        recorder = LeRobotRecorder(
+            dataset=dataset,
+            task=dataset_cfg.get("task_name", "teleoperation"),
         )
 
-    # Run main control loop
-    run_control_loop(env, agent, save_interface)
+    # VLA 정책은 버튼 클릭 시 lazy-load (CUDA init 전에 fork하면 segfault 발생)
+    vla_demo_fn = None
+    _vla_policy = [None]  # lazy-load용 컨테이너
+
+    # Teleoperation toggle event (set = active); starts OFF
+    teleop_event = threading.Event()
+
+    # Control loop records frames when recorder is active
+    import queue as _queue
+    import numpy as _np
+    _record_queue: _queue.Queue = _queue.Queue(maxsize=300)
+    _home_target: list = []  # 비어있으면 go_home 비활성
+
+    _record_frame_count = [0]
+
+    def record_worker():
+        """add_frame을 별도 스레드에서 처리. 카메라는 제어 루프에서 미리 읽어서 전달."""
+        while True:
+            item = _record_queue.get()
+            if item is None:
+                _record_queue.task_done()
+                break
+            obs_snap, action_snap, imgs = item
+            try:
+                wrist_img = imgs.get("wrist")
+                if wrist_img is not None:
+                    import cv2 as _cv2
+                    wrist_bgr = _cv2.cvtColor(wrist_img, _cv2.COLOR_RGB2BGR)
+                    ydx, ydy = compute_yellow_displacement(wrist_bgr)
+                else:
+                    ydx, ydy = 0.0, 0.0
+                state = _np.concatenate([
+                    obs_snap["joint_positions"],
+                    obs_snap["joint_velocities"],
+                    obs_snap["gripper_position"],
+                    _np.array([ydx, ydy], dtype=_np.float32),
+                ])
+                recorder.add_frame(state=state, action=action_snap, images=imgs)
+                _record_frame_count[0] += 1
+            except Exception as e:
+                import traceback as _tb
+                print(f"[RecordWorker] Error: {e}")
+                _tb.print_exc()
+            finally:
+                _record_queue.task_done()
+        print(f"[RecordWorker] Done. Total frames added: {_record_frame_count[0]}")
+
+    record_thread = threading.Thread(target=record_worker, daemon=True)
+    record_thread.start()
+
+    def control_loop_with_record():
+        import traceback
+        try:
+            obs = env.get_obs()
+        except Exception as e:
+            print(f"[ControlLoop] Failed to get initial obs: {e}")
+            return
+        print("[ControlLoop] Started. Waiting for Teleop ON...")
+        while True:
+            try:
+                if not teleop_event.is_set():
+                    if _home_target:
+                        # servoJ로 홈 위치까지 천천히 이동
+                        # obs가 stale할 수 있으므로 항상 현재 위치를 새로 읽음
+                        try:
+                            obs = env.get_obs()
+                        except Exception:
+                            pass
+                        target = _np.array(_home_target)
+                        current = _np.array(obs["joint_positions"][:6])
+                        diff = target - current
+                        if _np.max(_np.abs(_np.rad2deg(diff))) < 1.0:
+                            _home_target.clear()
+                            print("[GoHome] Done.")
+                        else:
+                            step = _np.clip(diff, -0.06, 0.06)
+                            obs = env.step(_np.append(current + step, [1.0]))
+                        _cached_ur_joints[0] = obs["joint_positions"][:6]
+                    else:
+                        # idle 상태에서도 GELLO/UR 관절값을 갱신해야
+                        # 텔레오프 재시작 시 안전 체크에 stale 값이 쓰이지 않음
+                        # VLA 실행 중(_vla_stop이 clear)에는 env를 건드리지 않음
+                        # (VLA와 같은 ZMQ 소켓을 동시에 쓰면 ZMQError 발생)
+                        vla_running = vla_cfg.get("checkpoint") and not _vla_stop.is_set()
+                        if not vla_running:
+                            try:
+                                obs = env.get_obs()
+                                _cached_ur_joints[0] = obs["joint_positions"][:6]
+                            except Exception:
+                                pass
+                        try:
+                            idle_action = agent.act(obs)
+                            _cached_gello_joints[0] = idle_action[:6].copy()
+                        except Exception:
+                            pass
+                        time.sleep(1.0 / cfg.get("hz", 30))
+                    continue
+                action = agent.act(obs)
+                _cached_gello_joints[0] = action[:6].copy()  # agent.act()가 gello 관절값 반환
+                # obs_T + action_T를 먼저 기록한 후 env.step() 실행
+                # (step 이후의 obs를 기록하면 state[T+1]과 action[T]가 짝지어지는 버그)
+                # 카메라도 제어 루프에서 직접 읽어서 robot state와 동기화
+                if recorder and recorder.is_recording:
+                    try:
+                        imgs = {}
+                        for _cam_key, _cam in cameras.items():
+                            _img, _ = _cam.read()
+                            imgs[_cam_key] = _img
+                        _record_queue.put_nowait((dict(obs), action.copy(), imgs))
+                    except _queue.Full:
+                        pass  # 큐가 꽉 찬 경우 프레임 드롭
+                obs = env.step(action)
+                _cached_ur_joints[0] = obs["joint_positions"][:6]
+            except Exception as e:
+                print(f"\n[ControlLoop] Error: {e}")
+                time.sleep(0.5)
+
+    # 제어 루프에서 캐싱된 관절값 — UI 스레드와 Dynamixel/ZMQ 동시 접근 방지
+    _cached_ur_joints   = [None]
+    _cached_gello_joints = [None]
+
+    control_thread = threading.Thread(target=control_loop_with_record, daemon=True)
+    control_thread.start()
+
+    # Parse gravity comp torque_to_pwm from YAML list
+    gc_torque_to_pwm = None
+    if gc_cfg.get("torque_to_pwm"):
+        import numpy as np
+        gc_torque_to_pwm = np.array(gc_cfg["torque_to_pwm"], dtype=float)
+
+    # Get DynamixelRobot from GelloAgent for gravity compensation
+    gello_robot = getattr(agent, "_robot", None)
+
+    # Joint position getters — 캐시 반환 (UI 스레드에서 Dynamixel/ZMQ 직접 접근 금지)
+    def get_gello_joints():
+        return _cached_gello_joints[0]
+
+    def get_ur_joints():
+        return _cached_ur_joints[0]
+
+    # VLA Demo function — 첫 실행 시 lazy-load (fork-after-CUDA segfault 방지)
+    if vla_cfg.get("checkpoint"):
+        import sys as _sys, os as _os
+        _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+        from run_vla import load_policy, run_inference
+        import torch as _torch
+        _vla_device = "cuda" if _torch.cuda.is_available() else "cpu"
+        _vla_checkpoint = str(Path(vla_cfg["checkpoint"]).expanduser())
+        _vla_stop = threading.Event()
+
+        _vla_stats = [None]
+
+        def vla_demo_fn():
+            if _vla_policy[0] is None:
+                print(f"[VLA] 정책 로딩 중... (device={_vla_device})")
+                _vla_policy[0], _vla_stats[0] = load_policy(_vla_checkpoint, _vla_device)
+                print("[VLA] 정책 로딩 완료.")
+            _vla_stop.clear()
+            teleop_event.clear()
+            # VLA 시작 전 HOME으로 이동 (학습 데이터 시작 위치와 맞춤)
+            print("[VLA] 홈 위치로 이동 중...")
+            _home_target.clear()
+            _home_target.extend(_HOME_RAD)
+            while _home_target:  # 홈 도달까지 대기
+                if _vla_stop.is_set():
+                    return
+                time.sleep(0.1)
+            print("[VLA] 홈 도달. 추론 시작.")
+            time.sleep(0.5)  # 안정화 대기
+            run_inference(
+                env=env,
+                cameras=cameras,
+                policy=_vla_policy[0],
+                stats=_vla_stats[0] or {},
+                device=_vla_device,
+                fps=cfg.get("hz", 30),
+                chunk_size=vla_cfg.get("chunk_size", 20),
+                stop_event=_vla_stop,
+                speed_scale=vla_cfg.get("speed_scale", 1.0),
+            )
+
+    estop_fn = getattr(left_robot, "stop", None)
+
+    def stop_fn():
+        """VLA 및 텔레오퍼레이션을 부드럽게 정지 (하드웨어 E-STOP 아님)."""
+        teleop_event.clear()
+        _home_target.clear()
+        if vla_cfg.get("checkpoint"):
+            try:
+                _vla_stop.set()
+            except NameError:
+                pass
+        print("[STOP] VLA/Teleop stopped.")
+
+    import numpy as _np
+    _HOME_DEG = [-103.499, -75.961, -112.747, -81.345, 89.482, -13.642]
+    _HOME_RAD = _np.deg2rad(_HOME_DEG).tolist()
+
+    def go_home_fn():
+        print("[GoHome] Moving to home position...")
+        _home_target.clear()
+        _home_target.extend(_HOME_RAD)
+
+    panel = ControlPanel(
+        teleop_event=teleop_event,
+        gripper=gripper,
+        recorder=recorder,
+        vla_demo_fn=vla_demo_fn,
+        gello_robot=gello_robot,
+        gc_xml_path=gc_cfg.get("xml_path"),
+        gc_torque_to_pwm=gc_torque_to_pwm,
+        get_gello_joints_fn=get_gello_joints,
+        get_ur_joints_fn=get_ur_joints,
+        estop_fn=estop_fn,
+        stop_fn=stop_fn,
+        go_home_fn=go_home_fn,
+        cameras=cameras,
+        record_queue=_record_queue,
+    )
+    if recorder is not None:
+        import atexit as _atexit
+        _atexit.register(recorder.close)
+
+    try:
+        panel.run()
+    finally:
+        if recorder is not None:
+            recorder.close()
 
 
 if __name__ == "__main__":
