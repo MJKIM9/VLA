@@ -30,6 +30,6 @@ dataset:
   task_name: teleoperation
 
 vla:
-  checkpoint: /home/koras/checkpoints/ur10_act_v7/checkpoints/030000/pretrained_model
+  checkpoint: /home/koras/checkpoints/ur10_act_v6/checkpoints/030000/pretrained_model
   chunk_size: 30
   speed_scale: 3.0

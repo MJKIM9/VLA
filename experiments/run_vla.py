@@ -102,14 +102,10 @@ def obs_to_tensor(obs: dict, camera_keys: list, device: str,
     import torch
     import cv2
 
-    # dx/dy 고정 (0, 0) — 위치 일반화 비활성화
-    ydx, ydy = 0.0, 0.0
-
     state = np.concatenate([
         obs["joint_positions"],   # 7
         obs["joint_velocities"],  # 6
         obs["gripper_position"],  # 1
-        np.array([ydx, ydy], dtype=np.float32),  # 2
     ])
     state_t = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
 
