@@ -102,13 +102,8 @@ def obs_to_tensor(obs: dict, camera_keys: list, device: str,
     import torch
     import cv2
 
-    # 손목 카메라에서 노란색 물체 변위 계산
-    wrist_img = obs.get("observation.images.wrist")
-    if wrist_img is not None:
-        wrist_bgr = cv2.cvtColor(wrist_img, cv2.COLOR_RGB2BGR)
-        ydx, ydy = compute_yellow_displacement(wrist_bgr)
-    else:
-        ydx, ydy = 0.0, 0.0
+    # dx/dy 고정 (0, 0) — 위치 일반화 비활성화
+    ydx, ydy = 0.0, 0.0
 
     state = np.concatenate([
         obs["joint_positions"],   # 7
