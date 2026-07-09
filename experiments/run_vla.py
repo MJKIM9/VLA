@@ -97,7 +97,8 @@ def compute_yellow_displacement(img_bgr):
 
 
 def obs_to_tensor(obs: dict, camera_keys: list, device: str,
-                  img_height: int, img_width: int, stats: dict):
+                  img_height: int, img_width: int, stats: dict,
+                  dxdy_scale: float = 1.0, dxdy_buf=None):
     """Convert robot obs dict to ACTPolicy batch dict with normalization."""
     import torch
     import cv2
@@ -109,6 +110,16 @@ def obs_to_tensor(obs: dict, camera_keys: list, device: str,
         ydx, ydy = compute_yellow_displacement(wrist_bgr)
     else:
         ydx, ydy = 0.0, 0.0
+
+    # 이동평균 스무딩
+    if dxdy_buf is not None:
+        dxdy_buf.append((ydx, ydy))
+        ydx = float(np.mean([v[0] for v in dxdy_buf]))
+        ydy = float(np.mean([v[1] for v in dxdy_buf]))
+
+    # 영향 감쇠
+    ydx *= dxdy_scale
+    ydy *= dxdy_scale
 
     state = np.concatenate([
         obs["joint_positions"],   # 7
@@ -163,20 +174,26 @@ def run_inference(
     img_height: int = 480,
     img_width: int = 640,
     speed_scale: float = 1.0,
+    dxdy_scale: float = 0.4,
+    dxdy_smooth_n: int = 5,
 ):
     """Main inference loop. Runs until stop_event is set.
 
-    speed_scale: slow-motion factor. 1.0 = normal, 3.0 = 1/3 speed.
-    The loop sleeps speed_scale times longer between steps.
+    speed_scale:    slow-motion factor. 1.0 = normal, 3.0 = 1/3 speed.
+    dxdy_scale:     dx/dy 영향 감쇠 계수 (0~1). 0이면 무시, 1이면 원래 값.
+    dxdy_smooth_n:  dx/dy 이동평균 윈도우 크기 (프레임 수).
     """
+    import collections
     dt = speed_scale / fps
     camera_keys = [f"observation.images.{k}" for k in cameras]
 
     effective_hz = fps / speed_scale
     print(f"[VLA] Starting inference at {fps}Hz × 1/{speed_scale:.1f} = {effective_hz:.1f}Hz effective, chunk_size={chunk_size}")
+    print(f"[VLA] dx/dy scale={dxdy_scale}, smooth_n={dxdy_smooth_n}")
     policy.reset()
 
     obs = env.get_obs()
+    dxdy_buf = collections.deque(maxlen=dxdy_smooth_n)
 
     while not stop_event.is_set():
         t0 = time.time()
@@ -186,7 +203,8 @@ def run_inference(
             img, _ = cam.read(img_size=(img_width, img_height))
             obs[f"observation.images.{key}"] = img
 
-        batch = obs_to_tensor(obs, camera_keys, device, img_height, img_width, stats)
+        batch = obs_to_tensor(obs, camera_keys, device, img_height, img_width, stats,
+                              dxdy_scale=dxdy_scale, dxdy_buf=dxdy_buf)
 
         with torch.no_grad():
             action = policy.select_action(batch)   # (1, action_dim) — normalized space
