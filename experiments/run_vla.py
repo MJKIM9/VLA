@@ -47,16 +47,9 @@ class Args:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def load_policy(checkpoint_path: str, device: str, temporal_ensemble_coeff: float = 0.01):
-    from lerobot.policies.act.modeling_act import ACTPolicy, ACTTemporalEnsembler
+def load_policy(checkpoint_path: str, device: str):
+    from lerobot.policies.act.modeling_act import ACTPolicy
     policy = ACTPolicy.from_pretrained(checkpoint_path)
-
-    # Temporal Ensembling 활성화: 매 스텝 추론 후 지수 가중 평균 → 청크 경계 튀는 현상 제거
-    if temporal_ensemble_coeff is not None:
-        policy.config.temporal_ensemble_coeff = temporal_ensemble_coeff
-        policy.temporal_ensembler = ACTTemporalEnsembler(temporal_ensemble_coeff, policy.config.chunk_size)
-        print(f"[VLA] Temporal Ensembling 활성화 (coeff={temporal_ensemble_coeff})")
-
     policy.to(device)
     policy.eval()
 
