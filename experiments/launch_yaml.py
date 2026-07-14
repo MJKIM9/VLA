@@ -496,15 +496,17 @@ def main():
             _vla_stop.clear()
             teleop_event.clear()
 
-            def move_to(deg_list, label=""):
-                """지정 관절 자세(degree)로 이동 후 도달까지 대기."""
+            def move_cs(cs_pose, label="", speed=0.1, accel=0.5):
+                """카르테시안 직선 이동 (movel). cs_pose = [x, y, z, rx_deg, ry_deg, rz_deg]"""
+                if _vla_stop.is_set():
+                    return False
                 print(f"[Hybrid] {label}")
-                _home_target.clear()
-                _home_target.extend(_np.deg2rad(deg_list).tolist())
-                while _home_target:
-                    if _vla_stop.is_set():
-                        return False
-                    time.sleep(0.05)
+                pose_rad = list(cs_pose[:3]) + [_np.deg2rad(v) for v in cs_pose[3:]]
+                try:
+                    left_robot.robot.moveL(pose_rad, speed, accel)
+                except Exception as e:
+                    print(f"[Hybrid] moveL 실패: {e}")
+                    return False
                 time.sleep(0.3)
                 return True
 
@@ -520,13 +522,27 @@ def main():
                     print(f"[Hybrid] gripper 제어 실패: {e}")
                 time.sleep(0.5)
 
+            def move_home(label="6. home 자세"):
+                """홈 자세로 관절 공간 이동."""
+                if _vla_stop.is_set():
+                    return False
+                print(f"[Hybrid] {label}")
+                _home_target.clear()
+                _home_target.extend(_HOME_RAD)
+                while _home_target:
+                    if _vla_stop.is_set():
+                        return False
+                    time.sleep(0.05)
+                time.sleep(0.3)
+                return True
+
             # ── 1단계: 사전 티칭 동작 ───────────────────────────────────────
-            if not move_to(_PRE_GRASP_DEG,  "1. 케이블 파지 전 자세"): return
-            set_gripper(_GRIPPER_OPEN,       "2. gripper open")
-            if not move_to(_GRASP_DEG,       "3. 케이블 파지 자세"):   return
-            set_gripper(_GRIPPER_CLOSE,      "4. gripper close")
-            if not move_to(_POST_GRASP_DEG,  "5. 케이블 파지 후 자세"): return
-            if not move_to(_HOME_DEG,         "6. home 자세"):           return
+            if not move_cs(_PRE_GRASP_CS,  "1. 케이블 파지 전 자세"): return
+            set_gripper(_GRIPPER_OPEN,      "2. gripper open")
+            if not move_cs(_GRASP_CS,       "3. 케이블 파지 자세"):   return
+            set_gripper(_GRIPPER_CLOSE,     "4. gripper close")
+            if not move_cs(_POST_GRASP_CS,  "5. 케이블 파지 후 자세"): return
+            if not move_home():                                          return
 
             # ── 2단계: VLA 추론 ─────────────────────────────────────────────
             print("[Hybrid] 사전 동작 완료. VLA 추론 시작.")
@@ -560,11 +576,10 @@ def main():
     _HOME_DEG = [-89.797, -80.051, -109.583, -80.419, 89.491, 0.047]
     _HOME_RAD = _np.deg2rad(_HOME_DEG).tolist()
 
-    # ── 하이브리드 데모용 사전 티칭 자세 (degree) ─────────────────────────────
-    # TODO: 실제 자세로 채워주세요
-    _PRE_GRASP_DEG  = [-116.707, -95.994, -110.091, -63.968, 89.527, -27.004]  # 1. 케이블 파지 전 자세
-    _GRASP_DEG      = [-116.680, -105.458, -118.074, -46.517, 89.609, -27.115]  # 3. 케이블 파지 자세
-    _POST_GRASP_DEG = [-116.707, -95.994, -110.091, -63.968, 89.527, -27.004]  # 5. 케이블 파지 후 자세
+    # ── 하이브리드 데모용 사전 티칭 자세 (CS: x, y, z [m] / rx, ry, rz [deg]) ──
+    _PRE_GRASP_CS  = [-0.46883, -0.54319, 0.41521,  179.989,  0.002, -179.997]  # 1. 케이블 파지 전 자세
+    _GRASP_CS      = [-0.46882, -0.54321, 0.26036,  179.988,  0.002, -179.995]  # 3. 케이블 파지 자세
+    _POST_GRASP_CS = [-0.46883, -0.54319, 0.41521,  179.989,  0.002, -179.997]  # 5. 케이블 파지 후 자세
 
     _GRIPPER_OPEN  = 1.0   # 2. gripper open 값
     _GRIPPER_CLOSE = 0.0   # 4. gripper close 값
