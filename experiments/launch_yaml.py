@@ -531,7 +531,7 @@ def main():
         print("[STOP] VLA/Teleop stopped.")
 
     import numpy as _np
-    _HOME_DEG = [-103.499, -75.961, -112.747, -81.345, 89.482, -13.642]
+    _HOME_DEG = [-89.797, -80.051, -109.583, -80.419, 89.491, 0.047]
     _HOME_RAD = _np.deg2rad(_HOME_DEG).tolist()
 
     def go_home_fn():
