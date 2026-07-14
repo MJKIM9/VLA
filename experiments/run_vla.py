@@ -76,8 +76,8 @@ def load_policy(checkpoint_path: str, device: str):
     return policy, stats
 
 
-def compute_yellow_displacement(img_bgr):
-    """손목 카메라 이미지에서 노란색 물체의 중심 변위 (dx, dy) 반환 (-1~1 정규화)."""
+def detect_yellow_centroid(img_bgr):
+    """손목 카메라 이미지에서 노란색 물체 픽셀 중심 (u, v) 반환. 검출 실패 시 None."""
     import cv2
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, np.array([20, 80, 80]), np.array([35, 255, 255]))
@@ -85,27 +85,42 @@ def compute_yellow_displacement(img_bgr):
     mask = cv2.dilate(mask, None, iterations=2)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
-        return 0.0, 0.0
+        return None
     c = max(contours, key=cv2.contourArea)
     M = cv2.moments(c)
     if M["m00"] == 0:
-        return 0.0, 0.0
-    cx = M["m10"] / M["m00"]
-    cy = M["m01"] / M["m00"]
-    h, w = img_bgr.shape[:2]
-    return float((cx - w / 2) / (w / 2)), float((cy - h / 2) / (h / 2))
+        return None
+    return int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
+
+
+def compute_yellow_3d(img_bgr, wrist_cam) -> np.ndarray:
+    """손목 카메라 이미지에서 노란색 물체의 카메라 프레임 3D 좌표(미터) 반환."""
+    centroid = detect_yellow_centroid(img_bgr)
+    if centroid is None:
+        return np.zeros(3, dtype=np.float32)
+    u, v = centroid
+    return wrist_cam.pixel_to_3d(u, v)
 
 
 def obs_to_tensor(obs: dict, camera_keys: list, device: str,
-                  img_height: int, img_width: int, stats: dict):
+                  img_height: int, img_width: int, stats: dict,
+                  wrist_cam=None):
     """Convert robot obs dict to ACTPolicy batch dict with normalization."""
     import torch
     import cv2
+
+    # 손목 카메라로 노란 물체 3D 위치 계산
+    yellow_xyz = np.zeros(3, dtype=np.float32)
+    if wrist_cam is not None and f"observation.images.wrist" in obs:
+        wrist_img = obs["observation.images.wrist"]   # RGB
+        wrist_bgr = cv2.cvtColor(wrist_img, cv2.COLOR_RGB2BGR)
+        yellow_xyz = compute_yellow_3d(wrist_bgr, wrist_cam)
 
     state = np.concatenate([
         obs["joint_positions"],   # 7
         obs["joint_velocities"],  # 6
         obs["gripper_position"],  # 1
+        yellow_xyz,               # 3
     ])
     state_t = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
 
@@ -177,7 +192,8 @@ def run_inference(
             img, _ = cam.read(img_size=(img_width, img_height))
             obs[f"observation.images.{key}"] = img
 
-        batch = obs_to_tensor(obs, camera_keys, device, img_height, img_width, stats)
+        batch = obs_to_tensor(obs, camera_keys, device, img_height, img_width, stats,
+                              wrist_cam=cameras.get("wrist"))
 
         with torch.no_grad():
             action = policy.select_action(batch)   # (1, action_dim) — normalized space

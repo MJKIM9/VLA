@@ -16,32 +16,36 @@ from omegaconf import OmegaConf
 from gello.utils.launch_utils import instantiate_from_dict
 
 
-def compute_yellow_displacement(img_bgr):
-    """손목 카메라 이미지에서 노란색 물체의 중심 변위 (dx, dy) 반환.
-
-    반환값은 이미지 중심 기준으로 -1~1 정규화된 값.
-    노란색 물체가 검출되지 않으면 (0.0, 0.0) 반환.
-    """
+def detect_yellow_centroid(img_bgr):
+    """손목 카메라 이미지에서 노란색 물체의 픽셀 중심 (u, v) 반환. 검출 실패 시 None."""
     import cv2 as _cv2
     import numpy as _np2
     hsv = _cv2.cvtColor(img_bgr, _cv2.COLOR_BGR2HSV)
-    # 노란색 HSV 범위
     mask = _cv2.inRange(hsv, _np2.array([20, 80, 80]), _np2.array([35, 255, 255]))
     mask = _cv2.erode(mask, None, iterations=2)
     mask = _cv2.dilate(mask, None, iterations=2)
     contours, _ = _cv2.findContours(mask, _cv2.RETR_EXTERNAL, _cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
-        return 0.0, 0.0
+        return None
     c = max(contours, key=_cv2.contourArea)
     M = _cv2.moments(c)
     if M["m00"] == 0:
-        return 0.0, 0.0
-    cx = M["m10"] / M["m00"]
-    cy = M["m01"] / M["m00"]
-    h, w = img_bgr.shape[:2]
-    dx = (cx - w / 2) / (w / 2)
-    dy = (cy - h / 2) / (h / 2)
-    return float(dx), float(dy)
+        return None
+    return int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
+
+
+def compute_yellow_3d(img_bgr, wrist_cam):
+    """손목 카메라 이미지에서 노란색 물체의 카메라 프레임 3D 좌표(미터) 반환.
+
+    반환값: np.array([x, y, z]) — 검출 실패 또는 depth 무효 시 [0, 0, 0].
+    x: 오른쪽 양수, y: 아래 양수, z: 카메라 전방 거리.
+    """
+    import numpy as _np2
+    centroid = detect_yellow_centroid(img_bgr)
+    if centroid is None:
+        return _np2.zeros(3, dtype=_np2.float32)
+    u, v = centroid
+    return wrist_cam.pixel_to_3d(u, v)
 
 # Global variables for cleanup
 active_threads: List[threading.Thread] = []
@@ -307,8 +311,8 @@ def main():
         elif len(device_ids) == 1:
             cameras = {"wrist": RealSenseCamera(device_id=device_ids[0])}
 
-        # state = joint_pos(7) + joint_vel(6) + gripper(1) + yellow_dx(1) + yellow_dy(1) = 16
-        STATE_DIM  = left_robot.num_dofs() + 6 + 1 + 2
+        # state = joint_pos(7) + joint_vel(6) + gripper(1) + yellow_xyz(3) = 17
+        STATE_DIM  = left_robot.num_dofs() + 6 + 1 + 3
         ACTION_DIM = left_robot.num_dofs()
         dataset = make_lerobot_dataset(
             repo_id=dataset_cfg.get("repo_id", "koras/ur10_task"),
@@ -348,17 +352,18 @@ def main():
             obs_snap, action_snap, imgs = item
             try:
                 wrist_img = imgs.get("wrist")
-                if wrist_img is not None:
+                wrist_cam = cameras.get("wrist")
+                if wrist_img is not None and wrist_cam is not None:
                     import cv2 as _cv2
                     wrist_bgr = _cv2.cvtColor(wrist_img, _cv2.COLOR_RGB2BGR)
-                    ydx, ydy = compute_yellow_displacement(wrist_bgr)
+                    yellow_xyz = compute_yellow_3d(wrist_bgr, wrist_cam)
                 else:
-                    ydx, ydy = 0.0, 0.0
+                    yellow_xyz = _np.zeros(3, dtype=_np.float32)
                 state = _np.concatenate([
                     obs_snap["joint_positions"],
                     obs_snap["joint_velocities"],
                     obs_snap["gripper_position"],
-                    _np.array([ydx, ydy], dtype=_np.float32),
+                    yellow_xyz,
                 ])
                 recorder.add_frame(state=state, action=action_snap, images=imgs)
                 _record_frame_count[0] += 1

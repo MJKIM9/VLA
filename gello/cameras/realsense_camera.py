@@ -1,4 +1,5 @@
 import os
+import threading
 import time
 from typing import List, Optional, Tuple
 
@@ -44,8 +45,17 @@ class RealSenseCamera(CameraDriver):
 
         config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
         config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-        self._pipeline.start(config)
+        profile = self._pipeline.start(config)
         self._flip = flip
+        self._lock = threading.Lock()
+
+        # 카메라 내부 파라미터 저장 (3D 변환에 사용)
+        depth_sensor = profile.get_device().first_depth_sensor()
+        self.depth_scale = depth_sensor.get_depth_scale()  # raw → meters
+        color_stream = profile.get_stream(rs.stream.color).as_video_stream_profile()
+        intr = color_stream.get_intrinsics()
+        self.fx, self.fy = intr.fx, intr.fy
+        self.cx, self.cy = intr.ppx, intr.ppy
 
     def read(
         self,
@@ -63,12 +73,16 @@ class RealSenseCamera(CameraDriver):
         """
         import cv2
 
-        frames = self._pipeline.wait_for_frames()
-        color_frame = frames.get_color_frame()
-        color_image = np.asanyarray(color_frame.get_data())
-        depth_frame = frames.get_depth_frame()
-        depth_image = np.asanyarray(depth_frame.get_data())
-        # depth_image = cv2.convertScaleAbs(depth_image, alpha=0.03)
+        with self._lock:
+            frames = self._pipeline.wait_for_frames(timeout_ms=3000)
+            color_frame = frames.get_color_frame()
+            color_image = np.asanyarray(color_frame.get_data()).copy()
+            depth_frame = frames.get_depth_frame()
+            depth_image = np.asanyarray(depth_frame.get_data()).copy()
+
+        # 원본 해상도 depth 보존 (3D 변환용)
+        self._depth_raw = depth_image  # (480, 640) uint16, mm 단위
+
         if img_size is None:
             image = color_image[:, :, ::-1]
             depth = depth_image
@@ -84,6 +98,20 @@ class RealSenseCamera(CameraDriver):
             depth = depth[:, :, None]
 
         return image, depth
+
+    def pixel_to_3d(self, u: int, v: int) -> np.ndarray:
+        """픽셀 좌표 (u, v)를 카메라 프레임의 3D 좌표(미터)로 변환."""
+        if not hasattr(self, '_depth_raw') or self._depth_raw is None:
+            return np.zeros(3, dtype=np.float32)
+        h, w = self._depth_raw.shape[:2]
+        u = int(np.clip(u, 0, w - 1))
+        v = int(np.clip(v, 0, h - 1))
+        d = self._depth_raw[v, u] * self.depth_scale  # meters
+        if d <= 0.01 or d > 2.0:  # 유효 범위 밖
+            return np.zeros(3, dtype=np.float32)
+        x = (u - self.cx) * d / self.fx
+        y = (v - self.cy) * d / self.fy
+        return np.array([x, y, d], dtype=np.float32)
 
 
 def _debug_read(camera, save_datastream=False):
