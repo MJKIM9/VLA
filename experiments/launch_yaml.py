@@ -355,6 +355,8 @@ def main():
                 break
             obs_snap, action_snap, imgs = item
             try:
+                if not recorder.is_recording:
+                    continue
                 wrist_img = imgs.get("wrist")
                 wrist_cam = cameras.get("wrist")
                 if wrist_img is not None and wrist_cam is not None:
