@@ -495,16 +495,42 @@ def main():
                 print("[VLA] 정책 로딩 완료.")
             _vla_stop.clear()
             teleop_event.clear()
-            # VLA 시작 전 HOME으로 이동 (학습 데이터 시작 위치와 맞춤)
-            print("[VLA] 홈 위치로 이동 중...")
-            _home_target.clear()
-            _home_target.extend(_HOME_RAD)
-            while _home_target:  # 홈 도달까지 대기
-                if _vla_stop.is_set():
-                    return
-                time.sleep(0.1)
-            print("[VLA] 홈 도달. 추론 시작.")
-            time.sleep(0.5)  # 안정화 대기
+
+            def move_to(deg_list, label=""):
+                """지정 관절 자세(degree)로 이동 후 도달까지 대기."""
+                print(f"[Hybrid] {label}")
+                _home_target.clear()
+                _home_target.extend(_np.deg2rad(deg_list).tolist())
+                while _home_target:
+                    if _vla_stop.is_set():
+                        return False
+                    time.sleep(0.05)
+                time.sleep(0.3)
+                return True
+
+            def set_gripper(value, label=""):
+                """현재 관절 유지하며 그리퍼만 변경."""
+                print(f"[Hybrid] {label}")
+                try:
+                    obs = env.get_obs()
+                    joints = _np.array(obs["joint_positions"][:6])
+                    action = _np.append(joints, value)
+                    env.step(action)
+                except Exception as e:
+                    print(f"[Hybrid] gripper 제어 실패: {e}")
+                time.sleep(0.5)
+
+            # ── 1단계: 사전 티칭 동작 ───────────────────────────────────────
+            if not move_to(_PRE_GRASP_DEG,  "1. 케이블 파지 전 자세"): return
+            set_gripper(_GRIPPER_OPEN,       "2. gripper open")
+            if not move_to(_GRASP_DEG,       "3. 케이블 파지 자세"):   return
+            set_gripper(_GRIPPER_CLOSE,      "4. gripper close")
+            if not move_to(_POST_GRASP_DEG,  "5. 케이블 파지 후 자세"): return
+            if not move_to(_HOME_DEG,         "6. home 자세"):           return
+
+            # ── 2단계: VLA 추론 ─────────────────────────────────────────────
+            print("[Hybrid] 사전 동작 완료. VLA 추론 시작.")
+            time.sleep(0.5)
             run_inference(
                 env=env,
                 cameras=cameras,
@@ -533,6 +559,15 @@ def main():
     import numpy as _np
     _HOME_DEG = [-89.797, -80.051, -109.583, -80.419, 89.491, 0.047]
     _HOME_RAD = _np.deg2rad(_HOME_DEG).tolist()
+
+    # ── 하이브리드 데모용 사전 티칭 자세 (degree) ─────────────────────────────
+    # TODO: 실제 자세로 채워주세요
+    _PRE_GRASP_DEG  = [-89.797, -80.051, -109.583, -80.419, 89.491, 0.047]   # 1. 케이블 파지 전 자세
+    _GRASP_DEG      = [-89.797, -80.051, -109.583, -80.419, 89.491, 0.047]   # 3. 케이블 파지 자세
+    _POST_GRASP_DEG = [-89.797, -80.051, -109.583, -80.419, 89.491, 0.047]   # 5. 케이블 파지 후 자세
+
+    _GRIPPER_OPEN  = 1.0   # 2. gripper open 값
+    _GRIPPER_CLOSE = 0.0   # 4. gripper close 값
 
     def go_home_fn():
         print("[GoHome] Moving to home position...")
