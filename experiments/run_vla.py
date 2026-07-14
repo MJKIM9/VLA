@@ -76,11 +76,11 @@ def load_policy(checkpoint_path: str, device: str):
     return policy, stats
 
 
-def detect_yellow_centroid(img_bgr):
-    """손목 카메라 이미지에서 노란색 물체 픽셀 중심 (u, v) 반환. 검출 실패 시 None."""
+def _detect_color_centroid(img_bgr, lower_hsv, upper_hsv):
+    """HSV 범위로 색상 검출 후 픽셀 중심 (u, v) 반환. 검출 실패 시 None."""
     import cv2
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, np.array([20, 80, 80]), np.array([35, 255, 255]))
+    mask = cv2.inRange(hsv, np.array(lower_hsv), np.array(upper_hsv))
     mask = cv2.erode(mask, None, iterations=2)
     mask = cv2.dilate(mask, None, iterations=2)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -93,13 +93,17 @@ def detect_yellow_centroid(img_bgr):
     return int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
 
 
-def compute_yellow_3d(img_bgr, wrist_cam) -> np.ndarray:
-    """손목 카메라 이미지에서 노란색 물체의 카메라 프레임 3D 좌표(미터) 반환."""
-    centroid = detect_yellow_centroid(img_bgr)
-    if centroid is None:
-        return np.zeros(3, dtype=np.float32)
-    u, v = centroid
-    return wrist_cam.pixel_to_3d(u, v)
+def compute_alignment_xy(img_bgr, wrist_cam) -> np.ndarray:
+    """손목 카메라에서 빨간-노란 물체의 xy 오정렬 벡터(미터) 반환."""
+    yellow = _detect_color_centroid(img_bgr, [20, 80, 80], [35, 255, 255])
+    red    = _detect_color_centroid(img_bgr, [0, 120, 70], [10, 255, 255])
+    if yellow is None or red is None:
+        return np.zeros(2, dtype=np.float32)
+    yellow_3d = wrist_cam.pixel_to_3d(*yellow)
+    red_3d    = wrist_cam.pixel_to_3d(*red)
+    if np.all(yellow_3d == 0) or np.all(red_3d == 0):
+        return np.zeros(2, dtype=np.float32)
+    return (red_3d - yellow_3d)[:2]
 
 
 def obs_to_tensor(obs: dict, camera_keys: list, device: str,
@@ -109,18 +113,18 @@ def obs_to_tensor(obs: dict, camera_keys: list, device: str,
     import torch
     import cv2
 
-    # 손목 카메라로 노란 물체 3D 위치 계산
-    yellow_xyz = np.zeros(3, dtype=np.float32)
-    if wrist_cam is not None and f"observation.images.wrist" in obs:
+    # 손목 카메라로 빨강-노랑 xy 오정렬 계산
+    align_xy = np.zeros(2, dtype=np.float32)
+    if wrist_cam is not None and "observation.images.wrist" in obs:
         wrist_img = obs["observation.images.wrist"]   # RGB
         wrist_bgr = cv2.cvtColor(wrist_img, cv2.COLOR_RGB2BGR)
-        yellow_xyz = compute_yellow_3d(wrist_bgr, wrist_cam)
+        align_xy = compute_alignment_xy(wrist_bgr, wrist_cam)
 
     state = np.concatenate([
         obs["joint_positions"],   # 7
         obs["joint_velocities"],  # 6
         obs["gripper_position"],  # 1
-        yellow_xyz,               # 3
+        align_xy,                 # 2
     ])
     state_t = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
 

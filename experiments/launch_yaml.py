@@ -16,12 +16,12 @@ from omegaconf import OmegaConf
 from gello.utils.launch_utils import instantiate_from_dict
 
 
-def detect_yellow_centroid(img_bgr):
-    """손목 카메라 이미지에서 노란색 물체의 픽셀 중심 (u, v) 반환. 검출 실패 시 None."""
+def _detect_color_centroid(img_bgr, lower_hsv, upper_hsv):
+    """HSV 범위로 색상 검출 후 픽셀 중심 (u, v) 반환. 검출 실패 시 None."""
     import cv2 as _cv2
     import numpy as _np2
     hsv = _cv2.cvtColor(img_bgr, _cv2.COLOR_BGR2HSV)
-    mask = _cv2.inRange(hsv, _np2.array([20, 80, 80]), _np2.array([35, 255, 255]))
+    mask = _cv2.inRange(hsv, _np2.array(lower_hsv), _np2.array(upper_hsv))
     mask = _cv2.erode(mask, None, iterations=2)
     mask = _cv2.dilate(mask, None, iterations=2)
     contours, _ = _cv2.findContours(mask, _cv2.RETR_EXTERNAL, _cv2.CHAIN_APPROX_SIMPLE)
@@ -34,18 +34,22 @@ def detect_yellow_centroid(img_bgr):
     return int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
 
 
-def compute_yellow_3d(img_bgr, wrist_cam):
-    """손목 카메라 이미지에서 노란색 물체의 카메라 프레임 3D 좌표(미터) 반환.
+def compute_alignment_xy(img_bgr, wrist_cam):
+    """손목 카메라에서 빨간-노란 물체의 xy 오정렬 벡터(미터) 반환.
 
-    반환값: np.array([x, y, z]) — 검출 실패 또는 depth 무효 시 [0, 0, 0].
-    x: 오른쪽 양수, y: 아래 양수, z: 카메라 전방 거리.
+    반환값: np.array([dx, dy]) = red_xy - yellow_xy (카메라 프레임)
+    두 물체 중 하나라도 검출 실패 시 [0, 0] 반환.
     """
     import numpy as _np2
-    centroid = detect_yellow_centroid(img_bgr)
-    if centroid is None:
-        return _np2.zeros(3, dtype=_np2.float32)
-    u, v = centroid
-    return wrist_cam.pixel_to_3d(u, v)
+    yellow = _detect_color_centroid(img_bgr, [20, 80, 80], [35, 255, 255])
+    red    = _detect_color_centroid(img_bgr, [0, 120, 70], [10, 255, 255])
+    if yellow is None or red is None:
+        return _np2.zeros(2, dtype=_np2.float32)
+    yellow_3d = wrist_cam.pixel_to_3d(*yellow)
+    red_3d    = wrist_cam.pixel_to_3d(*red)
+    if _np2.all(yellow_3d == 0) or _np2.all(red_3d == 0):
+        return _np2.zeros(2, dtype=_np2.float32)
+    return (red_3d - yellow_3d)[:2]  # x, y만 반환
 
 # Global variables for cleanup
 active_threads: List[threading.Thread] = []
@@ -311,8 +315,8 @@ def main():
         elif len(device_ids) == 1:
             cameras = {"wrist": RealSenseCamera(device_id=device_ids[0])}
 
-        # state = joint_pos(7) + joint_vel(6) + gripper(1) + yellow_xyz(3) = 17
-        STATE_DIM  = left_robot.num_dofs() + 6 + 1 + 3
+        # state = joint_pos(7) + joint_vel(6) + gripper(1) + alignment_xy(2) = 16
+        STATE_DIM  = left_robot.num_dofs() + 6 + 1 + 2
         ACTION_DIM = left_robot.num_dofs()
         dataset = make_lerobot_dataset(
             repo_id=dataset_cfg.get("repo_id", "koras/ur10_task"),
@@ -356,14 +360,14 @@ def main():
                 if wrist_img is not None and wrist_cam is not None:
                     import cv2 as _cv2
                     wrist_bgr = _cv2.cvtColor(wrist_img, _cv2.COLOR_RGB2BGR)
-                    yellow_xyz = compute_yellow_3d(wrist_bgr, wrist_cam)
+                    align_xy = compute_alignment_xy(wrist_bgr, wrist_cam)
                 else:
-                    yellow_xyz = _np.zeros(3, dtype=_np.float32)
+                    align_xy = _np.zeros(2, dtype=_np.float32)
                 state = _np.concatenate([
                     obs_snap["joint_positions"],
                     obs_snap["joint_velocities"],
                     obs_snap["gripper_position"],
-                    yellow_xyz,
+                    align_xy,
                 ])
                 # 상대 action: GELLO 목표각 - UR 현재각 = 이번 스텝에 얼마나 움직일지
                 delta_action = action_snap - obs_snap["joint_positions"]
