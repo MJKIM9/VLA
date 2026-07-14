@@ -199,7 +199,10 @@ def run_inference(
             action = policy.select_action(batch)   # (1, action_dim) — normalized space
             action = unnormalize_action(action, stats, device)
 
-        action_np = action.squeeze(0).cpu().numpy()
+        delta_np = action.squeeze(0).cpu().numpy()
+        # 상대 action: 현재 관절각 + delta → 절대 목표각으로 변환
+        q_current = np.array(obs["joint_positions"])
+        action_np = q_current + delta_np
         obs = env.step(action_np)
 
         elapsed = time.time() - t0

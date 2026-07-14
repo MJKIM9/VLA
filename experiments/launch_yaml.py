@@ -365,7 +365,9 @@ def main():
                     obs_snap["gripper_position"],
                     yellow_xyz,
                 ])
-                recorder.add_frame(state=state, action=action_snap, images=imgs)
+                # 상대 action: GELLO 목표각 - UR 현재각 = 이번 스텝에 얼마나 움직일지
+                delta_action = action_snap - obs_snap["joint_positions"]
+                recorder.add_frame(state=state, action=delta_action, images=imgs)
                 _record_frame_count[0] += 1
             except Exception as e:
                 import traceback as _tb
