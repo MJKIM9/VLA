@@ -25,11 +25,11 @@ gravity_comp:
   torque_to_pwm: [5, 13, 13, 10, 6, 6]
 
 dataset:
-  dir: ~/datasets/ur10_task_v4
-  repo_id: koras/ur10_task_v4
+  dir: ~/datasets/ur10_task_v5
+  repo_id: koras/ur10_task_v5
   task_name: teleoperation
 
 vla:
-  checkpoint: /home/koras/checkpoints/ur10_act_v9/checkpoints/005000/pretrained_model
-  chunk_size: 30
-  speed_scale: 3.0
+  checkpoint: /home/koras/checkpoints/ur10_act_v14/checkpoints/020000/pretrained_model
+  chunk_size: 15
+  speed_scale: 1.0

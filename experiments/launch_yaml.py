@@ -34,22 +34,22 @@ def _detect_color_centroid(img_bgr, lower_hsv, upper_hsv):
     return int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
 
 
-def compute_alignment_xy(img_bgr, wrist_cam):
-    """손목 카메라에서 빨간-노란 물체의 xy 오정렬 벡터(미터) 반환.
+def compute_alignment_xyz(img_bgr, wrist_cam):
+    """손목 카메라에서 케이블(검정)-노란 물체의 xyz 오정렬 벡터(미터) 반환.
 
-    반환값: np.array([dx, dy]) = red_xy - yellow_xy (카메라 프레임)
-    두 물체 중 하나라도 검출 실패 시 [0, 0] 반환.
+    반환값: np.array([dx, dy, dz]) = cable_xyz - yellow_xyz (카메라 프레임)
+    두 물체 중 하나라도 검출 실패 시 [0, 0, 0] 반환.
     """
     import numpy as _np2
     yellow = _detect_color_centroid(img_bgr, [20, 80, 80], [35, 255, 255])
-    red    = _detect_color_centroid(img_bgr, [0, 120, 70], [10, 255, 255])
-    if yellow is None or red is None:
-        return _np2.zeros(2, dtype=_np2.float32)
+    cable  = _detect_color_centroid(img_bgr, [0, 0, 0], [180, 50, 50])
+    if yellow is None or cable is None:
+        return _np2.zeros(3, dtype=_np2.float32)
     yellow_3d = wrist_cam.pixel_to_3d(*yellow)
-    red_3d    = wrist_cam.pixel_to_3d(*red)
-    if _np2.all(yellow_3d == 0) or _np2.all(red_3d == 0):
-        return _np2.zeros(2, dtype=_np2.float32)
-    return (red_3d - yellow_3d)[:2]  # x, y만 반환
+    cable_3d  = wrist_cam.pixel_to_3d(*cable)
+    if _np2.all(yellow_3d == 0) or _np2.all(cable_3d == 0):
+        return _np2.zeros(3, dtype=_np2.float32)
+    return (cable_3d - yellow_3d)  # x, y, z 모두 반환
 
 # Global variables for cleanup
 active_threads: List[threading.Thread] = []
@@ -315,8 +315,8 @@ def main():
         elif len(device_ids) == 1:
             cameras = {"wrist": RealSenseCamera(device_id=device_ids[0])}
 
-        # state = joint_pos(7) + joint_vel(6) + gripper(1) + alignment_xy(2) = 16
-        STATE_DIM  = left_robot.num_dofs() + 6 + 1 + 2
+        # state = tcp_xyz_delta(3) + tcp_rpy(3) + gripper(1) + align_xyz(3) = 10
+        STATE_DIM  = 3 + 3 + 1 + 3
         ACTION_DIM = left_robot.num_dofs()
         dataset = make_lerobot_dataset(
             repo_id=dataset_cfg.get("repo_id", "koras/ur10_task"),
@@ -362,19 +362,30 @@ def main():
                 if wrist_img is not None and wrist_cam is not None:
                     import cv2 as _cv2
                     wrist_bgr = _cv2.cvtColor(wrist_img, _cv2.COLOR_RGB2BGR)
-                    align_xy = compute_alignment_xy(wrist_bgr, wrist_cam)
+                    align_xyz = compute_alignment_xyz(wrist_bgr, wrist_cam)
                 else:
-                    align_xy = _np.zeros(2, dtype=_np.float32)
+                    align_xyz = _np.zeros(3, dtype=_np.float32)
                 state = _np.concatenate([
-                    obs_snap["joint_positions"],
-                    obs_snap["joint_velocities"],
+                    obs_snap["tcp_xyz_delta"],
+                    obs_snap["tcp_rpy"],
                     obs_snap["gripper_position"],
-                    align_xy,
+                    align_xyz,
                 ])
                 # delta action = GELLO_t - UR_t
                 delta_action = action_snap - obs_snap["joint_positions"]
                 recorder.add_frame(state=state, action=delta_action, images=imgs)
                 _record_frame_count[0] += 1
+            except KeyError as e:
+                import traceback as _tb
+                print(f"[RecordWorker] KeyError: {e} — episode_buffer 손상, 초기화합니다")
+                _tb.print_exc()
+                # episode_buffer에 size 키가 없는 경우 복구
+                try:
+                    eb = getattr(recorder.dataset, 'episode_buffer', None)
+                    if eb is not None and 'size' not in eb:
+                        recorder.dataset.episode_buffer = recorder.dataset.create_episode_buffer()
+                except Exception:
+                    pass
             except Exception as e:
                 import traceback as _tb
                 print(f"[RecordWorker] Error: {e}")
@@ -411,7 +422,7 @@ def main():
                             _home_target.clear()
                             print("[GoHome] Done.")
                         else:
-                            step = _np.clip(diff, -0.06, 0.06)
+                            step = _np.clip(diff, -0.01164, 0.01164)  # 20 deg/s @ 30Hz
                             obs = env.step(_np.append(current + step, [1.0]))
                         _cached_ur_joints[0] = obs["joint_positions"][:6]
                     else:
@@ -495,29 +506,94 @@ def main():
                 print("[VLA] 정책 로딩 완료.")
             _vla_stop.clear()
             teleop_event.clear()
+            time.sleep(0.3)  # 제어루프 마지막 servoJ 전송 완료 대기
+            # servoJ 스크립트를 완전히 종료하고 RTDE 스크립트 재시작
+            # (reuploadScript 없이 moveL 호출 시 "another thread controlling" 에러 발생)
+            try:
+                left_robot.robot.servoStop(10.0)
+            except Exception:
+                pass
+            time.sleep(0.1)
+            try:
+                left_robot.robot.reuploadScript()
+                print("[Hybrid] RTDE 스크립트 재시작 완료")
+            except Exception as e:
+                print(f"[Hybrid] reuploadScript 실패: {e}")
+            time.sleep(0.3)
+            try:
+                cur = left_robot.r_inter.getActualTCPPose()
+                print(f"[Hybrid] 현재 TCP: {[round(v,4) for v in cur]}")
+            except Exception as e:
+                print(f"[Hybrid] TCP 읽기 실패: {e}")
+
+            def _euler_zyx_deg_to_rot_vec(rx_deg, ry_deg, rz_deg):
+                """ZYX Euler 각도(degree) → UR rotation vector(radian) 변환."""
+                rx = _np.deg2rad(rx_deg)
+                ry = _np.deg2rad(ry_deg)
+                rz = _np.deg2rad(rz_deg)
+                Rx = _np.array([[1, 0, 0], [0, _np.cos(rx), -_np.sin(rx)], [0, _np.sin(rx), _np.cos(rx)]])
+                Ry = _np.array([[_np.cos(ry), 0, _np.sin(ry)], [0, 1, 0], [-_np.sin(ry), 0, _np.cos(ry)]])
+                Rz = _np.array([[_np.cos(rz), -_np.sin(rz), 0], [_np.sin(rz), _np.cos(rz), 0], [0, 0, 1]])
+                R = Rz @ Ry @ Rx
+                angle = _np.arccos(_np.clip((_np.trace(R) - 1) / 2, -1.0, 1.0))
+                if abs(angle) < 1e-10:
+                    return [0.0, 0.0, 0.0]
+                axis = _np.array([R[2,1]-R[1,2], R[0,2]-R[2,0], R[1,0]-R[0,1]]) / (2 * _np.sin(angle))
+                return (axis * angle).tolist()
 
             def move_cs(cs_pose, label="", speed=0.1, accel=0.5):
-                """카르테시안 직선 이동 (movel). cs_pose = [x, y, z, rx_deg, ry_deg, rz_deg]"""
+                """카르테시안 직선 이동. cs_pose = [x, y, z, rx_deg, ry_deg, rz_deg]"""
                 if _vla_stop.is_set():
                     return False
                 print(f"[Hybrid] {label}")
-                pose_rad = list(cs_pose[:3]) + [_np.deg2rad(v) for v in cs_pose[3:]]
+                rot_vec = _euler_zyx_deg_to_rot_vec(cs_pose[3], cs_pose[4], cs_pose[5])
+                pose_rad = list(cs_pose[:3]) + rot_vec
+                print(f"[Hybrid]   moveL 목표: {[round(v,4) for v in pose_rad]}")
+
+                # 매 이동 전 RTDE 스크립트 완전 재시작
+                # (이전 moveL/servoJ 잔류 상태가 다음 moveL을 막는 것 방지)
                 try:
-                    left_robot.robot.moveL(pose_rad, speed, accel)
+                    left_robot.robot.reuploadScript()
+                except Exception as e:
+                    print(f"[Hybrid] reuploadScript 실패: {e}")
+                for _ in range(30):  # 스크립트 실행 확인 (최대 3초)
+                    try:
+                        if left_robot.robot.isProgramRunning():
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(0.1)
+                time.sleep(0.2)  # 스크립트 초기화 완료 대기
+
+                # STOP watchdog: 20ms 간격으로 감시, 감지 시 즉시 stopL
+                _wd_stop = threading.Event()
+                def _watchdog():
+                    while not _wd_stop.wait(timeout=0.02):
+                        if _vla_stop.is_set():
+                            try:
+                                left_robot.robot.stopL(2.0)
+                            except Exception:
+                                pass
+                            return
+                threading.Thread(target=_watchdog, daemon=True).start()
+
+                try:
+                    left_robot.robot.moveL(pose_rad, speed, accel)  # sync
+                    return not _vla_stop.is_set()
                 except Exception as e:
                     print(f"[Hybrid] moveL 실패: {e}")
                     return False
-                time.sleep(0.3)
-                return True
+                finally:
+                    _wd_stop.set()
 
             def set_gripper(value, label=""):
-                """현재 관절 유지하며 그리퍼만 변경."""
+                """그리퍼 직접 제어. value = raw position (0=닫힘, 1000=열림)."""
                 print(f"[Hybrid] {label}")
+                if gripper is None:
+                    print("[Hybrid] gripper 없음 — 건너뜀")
+                    return
                 try:
-                    obs = env.get_obs()
-                    joints = _np.array(obs["joint_positions"][:6])
-                    action = _np.append(joints, value)
-                    env.step(action)
+                    gripper.set_position(int(value))
                 except Exception as e:
                     print(f"[Hybrid] gripper 제어 실패: {e}")
                 time.sleep(0.5)
@@ -537,10 +613,12 @@ def main():
                 return True
 
             # ── 1단계: 사전 티칭 동작 ───────────────────────────────────────
-            if not move_cs(_PRE_GRASP_CS,  "1. 케이블 파지 전 자세"): return
-            set_gripper(_GRIPPER_OPEN,      "2. gripper open")
+            set_gripper(_GRIPPER_OPEN,      "1. gripper open")
+            time.sleep(0.5)
+            if not move_cs(_PRE_GRASP_CS,  "2. 케이블 파지 전 자세"): return
             if not move_cs(_GRASP_CS,       "3. 케이블 파지 자세"):   return
             set_gripper(_GRIPPER_CLOSE,     "4. gripper close")
+            time.sleep(0.5)
             if not move_cs(_POST_GRASP_CS,  "5. 케이블 파지 후 자세"): return
             if not move_home():                                          return
 
@@ -557,6 +635,7 @@ def main():
                 chunk_size=vla_cfg.get("chunk_size", 20),
                 stop_event=_vla_stop,
                 speed_scale=vla_cfg.get("speed_scale", 1.0),
+                direct_robot=left_robot,  # ZMQ 우회: 로봇 직접 제어
             )
 
     estop_fn = getattr(left_robot, "stop", None)
@@ -581,8 +660,8 @@ def main():
     _GRASP_CS      = [-0.46882, -0.54321, 0.26036,  179.988,  0.002, -179.995]  # 3. 케이블 파지 자세
     _POST_GRASP_CS = [-0.46883, -0.54319, 0.41521,  179.989,  0.002, -179.997]  # 5. 케이블 파지 후 자세
 
-    _GRIPPER_OPEN  = 1.0   # 2. gripper open 값
-    _GRIPPER_CLOSE = 0.0   # 4. gripper close 값
+    _GRIPPER_OPEN  = 500   # gripper open (0=닫힘, 1000=열림)
+    _GRIPPER_CLOSE = 0     # gripper close
 
     def go_home_fn():
         print("[GoHome] Moving to home position...")

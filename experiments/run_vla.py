@@ -50,6 +50,7 @@ class Args:
 def load_policy(checkpoint_path: str, device: str):
     from lerobot.policies.act.modeling_act import ACTPolicy
     policy = ACTPolicy.from_pretrained(checkpoint_path)
+    policy.config.n_action_steps = 15
     policy.to(device)
     policy.eval()
 
@@ -93,17 +94,17 @@ def _detect_color_centroid(img_bgr, lower_hsv, upper_hsv):
     return int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
 
 
-def compute_alignment_xy(img_bgr, wrist_cam) -> np.ndarray:
-    """손목 카메라에서 빨간-노란 물체의 xy 오정렬 벡터(미터) 반환."""
+def compute_alignment_xyz(img_bgr, wrist_cam) -> np.ndarray:
+    """손목 카메라에서 케이블(검정)-노란 물체의 xyz 오정렬 벡터(미터) 반환."""
     yellow = _detect_color_centroid(img_bgr, [20, 80, 80], [35, 255, 255])
-    red    = _detect_color_centroid(img_bgr, [0, 120, 70], [10, 255, 255])
-    if yellow is None or red is None:
-        return np.zeros(2, dtype=np.float32)
+    cable  = _detect_color_centroid(img_bgr, [0, 0, 0], [180, 50, 50])
+    if yellow is None or cable is None:
+        return np.zeros(3, dtype=np.float32)
     yellow_3d = wrist_cam.pixel_to_3d(*yellow)
-    red_3d    = wrist_cam.pixel_to_3d(*red)
-    if np.all(yellow_3d == 0) or np.all(red_3d == 0):
-        return np.zeros(2, dtype=np.float32)
-    return (red_3d - yellow_3d)[:2]
+    cable_3d  = wrist_cam.pixel_to_3d(*cable)
+    if np.all(yellow_3d == 0) or np.all(cable_3d == 0):
+        return np.zeros(3, dtype=np.float32)
+    return (cable_3d - yellow_3d)
 
 
 def obs_to_tensor(obs: dict, camera_keys: list, device: str,
@@ -113,19 +114,19 @@ def obs_to_tensor(obs: dict, camera_keys: list, device: str,
     import torch
     import cv2
 
-    # 손목 카메라로 빨강-노랑 xy 오정렬 계산
-    align_xy = np.zeros(2, dtype=np.float32)
+    # 손목 카메라로 빨강-노랑 xyz 오정렬 계산
+    align_xyz = np.zeros(3, dtype=np.float32)
     if wrist_cam is not None and "observation.images.wrist" in obs:
         wrist_img = obs["observation.images.wrist"]   # RGB
         wrist_bgr = cv2.cvtColor(wrist_img, cv2.COLOR_RGB2BGR)
-        align_xy = compute_alignment_xy(wrist_bgr, wrist_cam)
+        align_xyz = compute_alignment_xyz(wrist_bgr, wrist_cam)
 
     state = np.concatenate([
-        obs["joint_positions"],   # 7
-        obs["joint_velocities"],  # 6
-        obs["gripper_position"],  # 1
-        align_xy,                 # 2
-    ])
+        obs["tcp_xyz_delta"],      # 3
+        obs["tcp_rpy"],            # 3
+        obs["gripper_position"],   # 1
+        align_xyz,                 # 3
+    ])  # 총 10차원
     state_t = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
 
     # Normalize observation.state: z = (x - mean) / (std + eps)
@@ -161,6 +162,27 @@ def unnormalize_action(action: "torch.Tensor", stats: dict, device: str) -> "tor
     return action * std + mean
 
 
+class _CameraBuffer:
+    """카메라를 백그라운드 스레드에서 계속 읽고 최신 프레임을 즉시 반환."""
+    def __init__(self, cam, img_size):
+        self._cam = cam
+        self._img_size = img_size
+        self._frame = None
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        while True:
+            img, _ = self._cam.read(img_size=self._img_size)
+            with self._lock:
+                self._frame = img
+
+    def get(self):
+        with self._lock:
+            return self._frame
+
+
 def run_inference(
     env,
     cameras: dict,
@@ -173,47 +195,107 @@ def run_inference(
     img_height: int = 480,
     img_width: int = 640,
     speed_scale: float = 1.0,
+    direct_robot=None,
 ):
     """Main inference loop. Runs until stop_event is set.
 
-    speed_scale: slow-motion factor. 1.0 = normal, 3.0 = 1/3 speed.
-    The loop sleeps speed_scale times longer between steps.
+    direct_robot: URRobot 인스턴스를 직접 전달하면 ZMQ 없이 로봇 직접 제어.
+                  None이면 기존 env(ZMQ) 경로 사용.
     """
     dt = speed_scale / fps
     camera_keys = [f"observation.images.{k}" for k in cameras]
 
     effective_hz = fps / speed_scale
-    print(f"[VLA] Starting inference at {fps}Hz × 1/{speed_scale:.1f} = {effective_hz:.1f}Hz effective, chunk_size={chunk_size}")
+    mode = "직접(ZMQ 우회)" if direct_robot is not None else "ZMQ"
+    print(f"[VLA] Starting inference at {fps}Hz × 1/{speed_scale:.1f} = {effective_hz:.1f}Hz effective, chunk_size={chunk_size}, mode={mode}")
     policy.reset()
 
-    obs = env.get_obs()
+    obs = direct_robot.get_observations() if direct_robot is not None else env.get_obs()
+
+    # 카메라 백그라운드 버퍼 시작 (블로킹 방지)
+    cam_buffers = {key: _CameraBuffer(cam, (img_width, img_height)) for key, cam in cameras.items()}
+    # 모든 카메라 버퍼에 첫 프레임이 들어올 때까지 대기
+    print("[VLA] 카메라 버퍼 준비 대기...")
+    while not stop_event.is_set():
+        if all(cam_buffers[k].get() is not None for k in cameras):
+            break
+        time.sleep(0.01)
+    print("[VLA] 카메라 버퍼 준비 완료")
+
+    # 비동기 추론: chunk 경계에서 다음 chunk를 백그라운드로 미리 계산
+    import concurrent.futures
+    _executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    _next_future = None   # 다음 chunk 추론 결과 (Future)
+    _step_in_chunk = 0
+    _cached_actions = []  # 현재 chunk 액션 리스트
+
+    def _infer_chunk(batch_snapshot):
+        """백그라운드에서 chunk_size개 액션을 한 번에 계산."""
+        actions = []
+        with torch.no_grad():
+            for _ in range(chunk_size):
+                a = policy.select_action(batch_snapshot)
+                a = unnormalize_action(a, stats, device)
+                actions.append(a.squeeze(0).cpu().numpy())
+        return actions
+
+    # 첫 chunk 동기 실행 (워밍업)
+    for key in cameras:
+        img = cam_buffers[key].get()
+        if img is not None:
+            obs[f"observation.images.{key}"] = img
+    _batch0 = obs_to_tensor(obs, camera_keys, device, img_height, img_width, stats,
+                            wrist_cam=cameras.get("wrist"))
+    policy.reset()
+    _cached_actions = _infer_chunk(_batch0)
+    _step_in_chunk = 0
 
     while not stop_event.is_set():
         t0 = time.time()
 
-        # Read cameras into obs dict
-        for key, cam in cameras.items():
-            img, _ = cam.read(img_size=(img_width, img_height))
-            obs[f"observation.images.{key}"] = img
+        # 카메라 버퍼에서 즉시 읽기 (블로킹 없음)
+        for key in cameras:
+            img = cam_buffers[key].get()
+            if img is not None:
+                obs[f"observation.images.{key}"] = img
 
-        batch = obs_to_tensor(obs, camera_keys, device, img_height, img_width, stats,
-                              wrist_cam=cameras.get("wrist"))
+        # chunk 첫 step에 다음 chunk 비동기 추론 시작 (15 step × 33ms = 500ms 여유)
+        if _step_in_chunk == 0 and _next_future is None:
+            batch_snap = obs_to_tensor(obs, camera_keys, device, img_height, img_width, stats,
+                                       wrist_cam=cameras.get("wrist"))
+            _next_future = _executor.submit(_infer_chunk, batch_snap)
 
-        with torch.no_grad():
-            action = policy.select_action(batch)   # (1, action_dim) — normalized space
-            action = unnormalize_action(action, stats, device)
+        # 현재 chunk에서 액션 꺼내기
+        delta_np = _cached_actions[_step_in_chunk]
+        _step_in_chunk += 1
 
-        delta_np = action.squeeze(0).cpu().numpy()
-        # 상대 action: 현재 관절각 + delta → 절대 목표각으로 변환
+        # chunk 소진 시 다음 chunk로 교체
+        if _step_in_chunk >= chunk_size:
+            t_wait = time.time()
+            _cached_actions = _next_future.result()
+            wait_ms = (time.time() - t_wait) * 1000
+            if wait_ms > 2.0:
+                print(f"[VLA] 다음 chunk 대기: {wait_ms:.1f}ms")
+            _next_future = None
+            _step_in_chunk = 0
+
         q_current = np.array(obs["joint_positions"])
         action_np = q_current + delta_np
-        obs = env.step(action_np)
+
+        if direct_robot is not None:
+            direct_robot.command_joint_state(action_np, current_joints=q_current[:6])
+            obs = direct_robot.get_observations(full=False)
+        else:
+            obs = env.step(action_np)
 
         elapsed = time.time() - t0
         remaining = dt - elapsed
         if remaining > 0:
             time.sleep(remaining)
+        else:
+            print(f"[VLA] 주기 초과: {elapsed*1000:.1f}ms (목표 {dt*1000:.1f}ms, 초과 {-remaining*1000:.1f}ms)")
 
+    _executor.shutdown(wait=False)
     print("[VLA] Inference stopped.")
 
 
