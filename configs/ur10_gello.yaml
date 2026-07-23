@@ -25,11 +25,25 @@ gravity_comp:
   torque_to_pwm: [5, 13, 13, 10, 6, 6]
 
 dataset:
-  dir: ~/datasets/ur10_task_v5
-  repo_id: koras/ur10_task_v5
+  dir: ~/datasets/ur10_task_v19
+  repo_id: koras/ur10_task_v19
   task_name: teleoperation
+  cartesian_action: true     # v19: action = tcp_xyz_delta(3) + gripper(1)
 
 vla:
-  checkpoint: /home/koras/checkpoints/ur10_act_v14/checkpoints/020000/pretrained_model
-  chunk_size: 15
-  speed_scale: 1.0
+  checkpoint: /home/koras/checkpoints/ur10_act_v19/checkpoints/020000/pretrained_model
+  chunk_size: 5
+  speed_scale: 2.0
+  delta_scale: 1.0
+  control_gripper: false
+  use_servoing: false
+  fix_orientation: false
+  z_approach: 0.295
+  z_floor: 0.29
+  use_z_freeze: false   # false: z_floor 하한선만 / "act": z 고정+ACT xy 제어 / "servoing": z 고정+서보잉 xy 제어
+  z_insert: 0.24
+  align_insert_threshold: 0.004
+  admittance_gain: 0.0001    # 0.0: 비활성 / VLA 추론 중 소프트웨어 어드미턴스 gain (작은 힘에도 부드럽게 반응)
+  admittance_deadband: 1.0   # N: 이 이하 힘은 노이즈로 무시
+  admittance_spring_k: 0.0   # VLA 추론 중엔 비활성 유지: 정책이 매 스텝 목표 위치를 새로 지시하므로 고정 시작점으로의 복원력은 정책 이동과 충돌함 (프리드라이브 버튼 모드에서만 사용)
+  admittance_damping_b: 0.0  # VLA 추론 중엔 비활성 유지: 실제 속도에 무조건 반대 작용해 정책이 의도한 이동까지 감쇠시킴 (프리드라이브 버튼 모드에서만 사용)

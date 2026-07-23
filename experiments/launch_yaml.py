@@ -16,40 +16,84 @@ from omegaconf import OmegaConf
 from gello.utils.launch_utils import instantiate_from_dict
 
 
+_CABLE_ROI_TOP    = 0.51
+_CABLE_ROI_BOTTOM = 0.65
+_CABLE_ROI_LEFT   = 0.448
+_CABLE_ROI_RIGHT  = 0.593
+_CABLE_TIP_STRIP  = 20
+_CABLE_TIP_Y_OFFSET = 0.05  # 케이블 tip y 좌표 위로 이동 (이미지 높이 비율)
+_MIN_AREA_COLOR   = 5    # 노란색 검출 최소 픽셀
+_MIN_AREA_CABLE   = 50   # 케이블(검정) 검출 최소 픽셀
+_COLOR_ROI_LEFT   = 0.15
+_COLOR_ROI_RIGHT  = 0.85
+
+
 def _detect_color_centroid(img_bgr, lower_hsv, upper_hsv):
-    """HSV 범위로 색상 검출 후 픽셀 중심 (u, v) 반환. 검출 실패 시 None."""
+    """HSV 범위로 검출된 모든 픽셀의 무게중심 (u, v) 반환. 검출 실패 시 None.
+    노란 커넥터처럼 케이블에 가려 두 덩어리로 쪼개지는 경우에도 중심을 올바르게 추정한다."""
     import cv2 as _cv2
     import numpy as _np2
     hsv = _cv2.cvtColor(img_bgr, _cv2.COLOR_BGR2HSV)
     mask = _cv2.inRange(hsv, _np2.array(lower_hsv), _np2.array(upper_hsv))
     mask = _cv2.erode(mask, None, iterations=2)
     mask = _cv2.dilate(mask, None, iterations=2)
+    _, _w = mask.shape
+    mask[:, :int(_w * _COLOR_ROI_LEFT)]  = 0
+    mask[:, int(_w * _COLOR_ROI_RIGHT):] = 0
+    pts = _np2.argwhere(mask > 0)  # (row, col)
+    if len(pts) < _MIN_AREA_COLOR:
+        return None
+    cy = int(pts[:, 0].mean())
+    cx = int(pts[:, 1].mean())
+    return cx, cy
+
+
+def _detect_cable_tip(img_bgr):
+    """케이블(검정) ROI 적용 후 하단 tip 픽셀 좌표 반환. 검출 실패 시 None."""
+    import cv2 as _cv2
+    import numpy as _np2
+    hsv = _cv2.cvtColor(img_bgr, _cv2.COLOR_BGR2HSV)
+    mask = _cv2.inRange(hsv, _np2.array([0, 0, 0]), _np2.array([180, 80, 80]))
+    mask = _cv2.erode(mask, None, iterations=2)
+    mask = _cv2.dilate(mask, None, iterations=2)
+    h, w = mask.shape
+    top_y   = int(h * _CABLE_ROI_TOP)
+    bot_y   = int(h * _CABLE_ROI_BOTTOM)
+    left_x  = int(w * _CABLE_ROI_LEFT)
+    right_x = int(w * _CABLE_ROI_RIGHT)
+    mask[:top_y] = 0
+    mask[bot_y:] = 0
+    mask[:, :left_x] = 0
+    mask[:, right_x:] = 0
     contours, _ = _cv2.findContours(mask, _cv2.RETR_EXTERNAL, _cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return None
     c = max(contours, key=_cv2.contourArea)
-    M = _cv2.moments(c)
-    if M["m00"] == 0:
+    if _cv2.contourArea(c) < _MIN_AREA_CABLE:
         return None
-    return int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
+    strip_top = max(0, bot_y - _CABLE_TIP_STRIP)
+    strip = mask[strip_top:bot_y, :]
+    cols = _np2.where(strip.any(axis=0))[0]
+    if len(cols) == 0:
+        return None
+    h_full = mask.shape[0]
+    return int(cols.mean()), bot_y - _CABLE_TIP_STRIP // 2 - int(h_full * _CABLE_TIP_Y_OFFSET)
 
 
 def compute_alignment_xyz(img_bgr, wrist_cam):
-    """손목 카메라에서 케이블(검정)-노란 물체의 xyz 오정렬 벡터(미터) 반환.
-
-    반환값: np.array([dx, dy, dz]) = cable_xyz - yellow_xyz (카메라 프레임)
+    """손목 카메라에서 케이블(검정) tip - 노란 물체의 xy 오정렬 벡터(미터) 반환.
+    depth 센서 대신 고정 작업거리로 픽셀 → 미터 변환 (z=0).
     두 물체 중 하나라도 검출 실패 시 [0, 0, 0] 반환.
     """
     import numpy as _np2
-    yellow = _detect_color_centroid(img_bgr, [20, 80, 80], [35, 255, 255])
-    cable  = _detect_color_centroid(img_bgr, [0, 0, 0], [180, 50, 50])
+    _FIXED_DEPTH = 0.30
+    yellow = _detect_color_centroid(img_bgr, [22, 150, 120], [32, 255, 255])
+    cable  = _detect_cable_tip(img_bgr)
     if yellow is None or cable is None:
         return _np2.zeros(3, dtype=_np2.float32)
-    yellow_3d = wrist_cam.pixel_to_3d(*yellow)
-    cable_3d  = wrist_cam.pixel_to_3d(*cable)
-    if _np2.all(yellow_3d == 0) or _np2.all(cable_3d == 0):
-        return _np2.zeros(3, dtype=_np2.float32)
-    return (cable_3d - yellow_3d)  # x, y, z 모두 반환
+    dx = (cable[0] - yellow[0]) * _FIXED_DEPTH / wrist_cam.fx
+    dy = (cable[1] - yellow[1]) * _FIXED_DEPTH / wrist_cam.fy
+    return _np2.array([dx, dy, 0.0], dtype=_np2.float32)
 
 # Global variables for cleanup
 active_threads: List[threading.Thread] = []
@@ -302,6 +346,7 @@ def main():
     # LeRobot recorder (카메라 없이도 state/action 저장 가능)
     recorder = None
     cameras = {}
+    _cartesian_action = dataset_cfg.get("cartesian_action", False)
     if dataset_cfg.get("dir"):
         from gello.data_utils.lerobot_recorder import LeRobotRecorder, make_lerobot_dataset
         from gello.cameras.realsense_camera import get_device_ids, RealSenseCamera
@@ -315,9 +360,11 @@ def main():
         elif len(device_ids) == 1:
             cameras = {"wrist": RealSenseCamera(device_id=device_ids[0])}
 
-        # state = tcp_xyz_delta(3) + tcp_rpy(3) + gripper(1) + align_xyz(3) = 10
-        STATE_DIM  = 3 + 3 + 1 + 3
-        ACTION_DIM = left_robot.num_dofs()
+        # state = tcp_xyz_delta(3) + tcp_rpy(3) + gripper(1) + align_xy(2) = 9
+        # action = tcp_xyz_delta(3) + tcp_rpy_delta(3) + gripper(1) = 7  (cartesian_action=True)
+        #        = joint_delta(7)                                         (cartesian_action=False)
+        STATE_DIM  = 3 + 3 + 1 + 2
+        ACTION_DIM = 7 if _cartesian_action else left_robot.num_dofs()
         dataset = make_lerobot_dataset(
             repo_id=dataset_cfg.get("repo_id", "koras/ur10_task"),
             root=str(Path(dataset_cfg["dir"]).expanduser()),
@@ -355,8 +402,6 @@ def main():
                 break
             obs_snap, action_snap, imgs = item
             try:
-                if not recorder.is_recording:
-                    continue
                 wrist_img = imgs.get("wrist")
                 wrist_cam = cameras.get("wrist")
                 if wrist_img is not None and wrist_cam is not None:
@@ -365,14 +410,27 @@ def main():
                     align_xyz = compute_alignment_xyz(wrist_bgr, wrist_cam)
                 else:
                     align_xyz = _np.zeros(3, dtype=_np.float32)
+                # state: 9-dim (align_xy[:2]만 포함, 추론 obs_to_tensor와 일치)
                 state = _np.concatenate([
                     obs_snap["tcp_xyz_delta"],
                     obs_snap["tcp_rpy"],
                     obs_snap["gripper_position"],
-                    align_xyz,
+                    align_xyz[:2],
                 ])
-                # delta action = GELLO_t - UR_t
-                delta_action = action_snap - obs_snap["joint_positions"]
+                if _cartesian_action:
+                    # Cartesian action: FK(GELLO) - FK(UR) in xyz + gripper delta
+                    try:
+                        gello_fk = left_robot.robot.getForwardKinematics(action_snap[:6].tolist())
+                        ur_fk = left_robot.robot.getForwardKinematics(obs_snap["joint_positions"][:6].tolist())
+                        xyz_delta_act = _np.array(gello_fk[:3]) - _np.array(ur_fk[:3])
+                        gripper_delta_act = _np.array([action_snap[-1] - obs_snap["joint_positions"][-1]])
+                        delta_action = _np.concatenate([xyz_delta_act, gripper_delta_act])
+                    except Exception as _fk_e:
+                        print(f"[RecordWorker] FK 실패: {_fk_e}, zero action 사용")
+                        delta_action = _np.zeros(4, dtype=_np.float32)
+                else:
+                    # joint space action (v17 방식)
+                    delta_action = action_snap - obs_snap["joint_positions"]
                 recorder.add_frame(state=state, action=delta_action, images=imgs)
                 _record_frame_count[0] += 1
             except KeyError as e:
@@ -467,6 +525,8 @@ def main():
     # 제어 루프에서 캐싱된 관절값 — UI 스레드와 Dynamixel/ZMQ 동시 접근 방지
     _cached_ur_joints   = [None]
     _cached_gello_joints = [None]
+    _vla_stop = threading.Event()  # 제어루프보다 먼저 정의 (스코프 오류 방지)
+    _vla_stop.set()                # 초기 상태: VLA 미실행
 
     control_thread = threading.Thread(target=control_loop_with_record, daemon=True)
     control_thread.start()
@@ -495,8 +555,6 @@ def main():
         import torch as _torch
         _vla_device = "cuda" if _torch.cuda.is_available() else "cpu"
         _vla_checkpoint = str(Path(vla_cfg["checkpoint"]).expanduser())
-        _vla_stop = threading.Event()
-
         _vla_stats = [None]
 
         def vla_demo_fn():
@@ -541,7 +599,7 @@ def main():
                 axis = _np.array([R[2,1]-R[1,2], R[0,2]-R[2,0], R[1,0]-R[0,1]]) / (2 * _np.sin(angle))
                 return (axis * angle).tolist()
 
-            def move_cs(cs_pose, label="", speed=0.1, accel=0.5):
+            def move_cs(cs_pose, label="", speed=0.2, accel=1.0):
                 """카르테시안 직선 이동. cs_pose = [x, y, z, rx_deg, ry_deg, rz_deg]"""
                 if _vla_stop.is_set():
                     return False
@@ -596,21 +654,100 @@ def main():
                     gripper.set_position(int(value))
                 except Exception as e:
                     print(f"[Hybrid] gripper 제어 실패: {e}")
-                time.sleep(0.5)
+                time.sleep(1.0)
 
-            def move_home(label="6. home 자세"):
-                """홈 자세로 관절 공간 이동."""
+            def move_z_fixed_rp(z_target, label="", speed=0.025, accel=0.15, tcp_frame=False):
+                """z를 이동. tcp_frame=True이면 TCP z축 방향으로 이동 (base_z가 z_target에 도달하도록)."""
+                if _vla_stop.is_set():
+                    return False
+                try:
+                    cur = left_robot.r_inter.getActualTCPPose()
+                except Exception as e:
+                    print(f"[Hybrid] TCP 읽기 실패: {e}")
+                    return False
+                # 현재 회전행렬 계산
+                rv = _np.array(cur[3:6])
+                angle = _np.linalg.norm(rv)
+                if angle < 1e-10:
+                    R = _np.eye(3)
+                else:
+                    ax = rv / angle
+                    K = _np.array([[0, -ax[2], ax[1]], [ax[2], 0, -ax[0]], [-ax[1], ax[0], 0]])
+                    R = _np.eye(3) + _np.sin(angle) * K + (1 - _np.cos(angle)) * (K @ K)
+
+                if tcp_frame:
+                    # TCP z축 방향으로 base_z가 z_target에 도달하도록 이동
+                    tcp_z = R[:, 2]  # TCP z축 (base 프레임)
+                    dz_base = z_target - cur[2]
+                    if abs(tcp_z[2]) < 0.1:
+                        print("[Hybrid] TCP z축이 수평에 가까워 tcp_frame 이동 불가 — base frame으로 대체")
+                        tcp_frame = False
+                    else:
+                        scale = dz_base / tcp_z[2]
+                        new_xyz = _np.array(cur[:3]) + tcp_z * scale
+                        target_pose = list(new_xyz) + list(cur[3:6])
+                if not tcp_frame:
+                    yaw = _np.arctan2(R[1, 0], R[0, 0])
+                    roll_r  = _np.deg2rad(-179.99)
+                    pitch_r = _np.deg2rad(0.0)
+                    cr, sr = _np.cos(roll_r),  _np.sin(roll_r)
+                    cp, sp = _np.cos(pitch_r), _np.sin(pitch_r)
+                    cy, sy = _np.cos(yaw),     _np.sin(yaw)
+                    Rx2 = _np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
+                    Ry2 = _np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
+                    Rz2 = _np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
+                    R2 = Rz2 @ Ry2 @ Rx2
+                    ang2 = _np.arccos(_np.clip((_np.trace(R2) - 1) / 2, -1.0, 1.0))
+                    if abs(ang2) < 1e-10:
+                        rv2 = [0.0, 0.0, 0.0]
+                    else:
+                        rv2 = list((ang2 / (2 * _np.sin(ang2))) * _np.array([
+                            R2[2,1] - R2[1,2], R2[0,2] - R2[2,0], R2[1,0] - R2[0,1]
+                        ]))
+                    target_pose = list(cur[:2]) + [z_target] + rv2
+                print(f"[Hybrid] {label} → TCP: {[round(v,4) for v in target_pose]}")
+                try:
+                    left_robot.robot.reuploadScript()
+                except Exception as e:
+                    print(f"[Hybrid] reuploadScript 실패: {e}")
+                for _ in range(30):
+                    try:
+                        if left_robot.robot.isProgramRunning():
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(0.1)
+                time.sleep(0.2)
+                _wd_stop2 = threading.Event()
+                def _watchdog2():
+                    while not _wd_stop2.wait(timeout=0.02):
+                        if _vla_stop.is_set():
+                            try:
+                                left_robot.robot.stopL(2.0)
+                            except Exception:
+                                pass
+                            return
+                threading.Thread(target=_watchdog2, daemon=True).start()
+                try:
+                    left_robot.robot.moveL(target_pose, speed, accel)
+                    return not _vla_stop.is_set()
+                except Exception as e:
+                    print(f"[Hybrid] moveL 실패: {e}")
+                    return False
+                finally:
+                    _wd_stop2.set()
+
+            def move_home(label="6. home 자세", speed=0.5, accel=0.5):
+                """홈 자세로 관절 공간 이동 (moveJ)."""
                 if _vla_stop.is_set():
                     return False
                 print(f"[Hybrid] {label}")
-                _home_target.clear()
-                _home_target.extend(_HOME_RAD)
-                while _home_target:
-                    if _vla_stop.is_set():
-                        return False
-                    time.sleep(0.05)
-                time.sleep(0.3)
-                return True
+                try:
+                    left_robot.robot.moveJ(_HOME_RAD, speed, accel)
+                    return True
+                except Exception as e:
+                    print(f"[Hybrid] moveJ 실패: {e}")
+                    return False
 
             # ── 1단계: 사전 티칭 동작 ───────────────────────────────────────
             set_gripper(_GRIPPER_OPEN,      "1. gripper open")
@@ -625,7 +762,16 @@ def main():
             # ── 2단계: VLA 추론 ─────────────────────────────────────────────
             print("[Hybrid] 사전 동작 완료. VLA 추론 시작.")
             time.sleep(0.5)
-            run_inference(
+            # VLA 추론 중: 소프트웨어 어드미턴스만 사용 (hardware forceMode 없음)
+            # UI ON 상태면 yaml의 admittance_gain 적용, OFF면 0.0
+            _eff_gain = vla_cfg.get("admittance_gain", 0.0) if _admittance_active[0] else 0.0
+            if _admittance_active[0]:
+                print(f"[Admittance] VLA 추론 중 소프트웨어 어드미턴스 적용 (gain={_eff_gain})")
+            _z_approach = vla_cfg.get("z_approach")
+            _z_floor    = vla_cfg.get("z_floor")
+            _z_insert   = vla_cfg.get("z_insert", 0.24)
+            _align_thr  = vla_cfg.get("align_insert_threshold", 0.002)
+            insertion_ready = run_inference(
                 env=env,
                 cameras=cameras,
                 policy=_vla_policy[0],
@@ -635,8 +781,41 @@ def main():
                 chunk_size=vla_cfg.get("chunk_size", 20),
                 stop_event=_vla_stop,
                 speed_scale=vla_cfg.get("speed_scale", 1.0),
-                direct_robot=left_robot,  # ZMQ 우회: 로봇 직접 제어
+                delta_scale=vla_cfg.get("delta_scale", 1.0),
+                use_servoing=vla_cfg.get("use_servoing", False),
+                fix_orientation=vla_cfg.get("fix_orientation", False),
+                direct_robot=left_robot,
+                z_approach_threshold=_z_approach,
+                z_floor=_z_floor,
+                use_z_freeze=vla_cfg.get("use_z_freeze", False),
+                align_insert_threshold=_align_thr,
+                cartesian_action=_cartesian_action,
+                control_gripper=vla_cfg.get("control_gripper", True),
+                admittance_gain=_eff_gain,
+                admittance_deadband=vla_cfg.get("admittance_deadband", 3.0),
+                admittance_spring_k=vla_cfg.get("admittance_spring_k", 0.0),
+                admittance_damping_b=vla_cfg.get("admittance_damping_b", 0.0),
             )
+
+            # ── 3단계: 삽입 시퀀스 (z+align 조건 충족 시) ─────────────────
+            if insertion_ready:
+                print("[VLA] 삽입 시퀀스 시작")
+                _vla_stop.clear()
+                try:
+                    left_robot.robot.servoStop(10.0)
+                except Exception:
+                    pass
+                time.sleep(0.1)
+                if move_z_fixed_rp(_z_insert, f"삽입 z={_z_insert}", tcp_frame=True):
+                    set_gripper(_GRIPPER_OPEN, "그리퍼 open")
+                    move_z_fixed_rp(0.34, "삽입 후 복귀 z=0.34", tcp_frame=True)
+
+            # ── 4단계: home 복귀 ─────────────────────────────────────────────
+            if insertion_ready:
+                set_gripper(_GRIPPER_CLOSE, "그리퍼 close")
+                print("[VLA] home 복귀")
+                move_home("home 복귀")
+
 
     estop_fn = getattr(left_robot, "stop", None)
 
@@ -649,6 +828,10 @@ def main():
                 _vla_stop.set()
             except NameError:
                 pass
+        try:
+            left_robot.robot.stopL(2.0)
+        except Exception:
+            pass
         print("[STOP] VLA/Teleop stopped.")
 
     import numpy as _np
@@ -663,10 +846,85 @@ def main():
     _GRIPPER_OPEN  = 500   # gripper open (0=닫힘, 1000=열림)
     _GRIPPER_CLOSE = 0     # gripper close
 
+    _admittance_active = [False]
+
+    _adm_bg_stop = [threading.Event()]
+    _adm_bg_stop[0].set()
+
+    def _start_admittance_bg():
+        import numpy as _np_adm
+        from scipy.spatial.transform import Rotation as _RotAdm
+
+        _ADM_GAIN      = 0.003   # (m/s) / N : 힘 → 속도 게인 (작은 힘에도 부드럽게 반응)
+        _ADM_DEADBAND  = 1.0     # N
+        _ADM_SPRING_K  = 1.5     # 1/s : 원위치 복원력 계수 (클수록 빨리 복귀)
+        _ADM_DAMPING_B = 0.3     # 무차원 : 실제 속도에 반대로 작용해 진동 억제
+        _ADM_FILTER_ALPHA = 0.2  # 낮을수록 힘 신호를 더 부드럽게(떨림 억제)
+
+        stop_ev = threading.Event()
+        _adm_bg_stop[0] = stop_ev
+        _origin_xyz = _np_adm.array(left_robot.r_inter.getActualTCPPose()[:3])
+        _ft_filtered = _np_adm.zeros(3)
+
+        def _loop():
+            nonlocal _ft_filtered
+            while not stop_ev.is_set():
+                # VLA 실행 중엔 건너뜀 (_vla_stop이 clear = VLA 실행 중)
+                if not _vla_stop.is_set():
+                    time.sleep(0.02)
+                    continue
+                try:
+                    ft_tcp = _np_adm.array(left_robot.r_inter.getActualTCPForce()[:3])
+                    tcp    = left_robot.r_inter.getActualTCPPose()
+                    pos    = _np_adm.array(tcp[:3])
+                    R      = _RotAdm.from_rotvec(tcp[3:6]).as_matrix()
+                    ft_base = R @ ft_tcp
+                    ft_base[0] = -ft_base[0]  # x축 반대 방향 보정
+                    ft_base[2] = -ft_base[2]  # z축 반대 방향 보정
+                    _ft_filtered = _ADM_FILTER_ALPHA * ft_base + (1 - _ADM_FILTER_ALPHA) * _ft_filtered
+                    ft_base = _ft_filtered
+                    ft_clipped = _np_adm.where(
+                        _np_adm.abs(ft_base) > _ADM_DEADBAND,
+                        (ft_base - _np_adm.sign(ft_base) * _ADM_DEADBAND) * _ADM_GAIN,
+                        0.0,
+                    )
+                    v_actual = _np_adm.array(left_robot.r_inter.getActualTCPSpeed()[:3])
+                    spring_term = -_ADM_SPRING_K * (pos - _origin_xyz)
+                    damping_term = -_ADM_DAMPING_B * v_actual
+                    vel = ft_clipped + spring_term + damping_term
+                    left_robot.robot.speedL(list(vel) + [0.0, 0.0, 0.0], 0.5, 0.04)
+                except Exception:
+                    pass
+                time.sleep(0.02)
+
+        threading.Thread(target=_loop, daemon=True).start()
+
     def go_home_fn():
         print("[GoHome] Moving to home position...")
-        _home_target.clear()
-        _home_target.extend(_HOME_RAD)
+        try:
+            left_robot.robot.stopL(2.0)
+        except Exception:
+            pass
+        try:
+            left_robot.robot.moveJ(_HOME_RAD, 0.5, 0.5)
+        except Exception as e:
+            print(f"[GoHome] moveJ 실패: {e}")
+
+    def admittance_on_fn():
+        _adm_bg_stop[0].set()
+        time.sleep(0.05)
+        _admittance_active[0] = True
+        _start_admittance_bg()
+        print("[Admittance] ON")
+
+    def admittance_off_fn():
+        _admittance_active[0] = False
+        _adm_bg_stop[0].set()
+        try:
+            left_robot.robot.stopL(2.0)
+        except Exception:
+            pass
+        print("[Admittance] OFF")
 
     panel = ControlPanel(
         teleop_event=teleop_event,
@@ -681,6 +939,8 @@ def main():
         estop_fn=estop_fn,
         stop_fn=stop_fn,
         go_home_fn=go_home_fn,
+        admittance_on_fn=admittance_on_fn,
+        admittance_off_fn=admittance_off_fn,
         cameras=cameras,
         record_queue=_record_queue,
     )

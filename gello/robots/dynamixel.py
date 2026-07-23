@@ -50,12 +50,12 @@ class DynamixelRobot(Robot):
         if joint_offsets is None:
             self._joint_offsets = np.zeros(len(joint_ids))
         else:
-            self._joint_offsets = np.array(joint_offsets)
+            self._joint_offsets = np.array(joint_offsets)  # type: ignore[assignment]
 
         if joint_signs is None:
             self._joint_signs = np.ones(len(joint_ids))
         else:
-            self._joint_signs = np.array(joint_signs)
+            self._joint_signs = np.array(joint_signs)  # type: ignore[assignment]
 
         assert len(self._joint_ids) == len(self._joint_offsets), (
             f"joint_ids: {len(self._joint_ids)}, "
@@ -75,13 +75,14 @@ class DynamixelRobot(Robot):
         else:
             self._driver = FakeDynamixelDriver(joint_ids)
         self._torque_on = False
-        self._last_pos = None
+        self._last_pos: Optional[np.ndarray] = None
         self._alpha = 0.99
 
         if start_joints is not None:
             # loop through all joints and add +- 2pi to the joint offsets to get the closest to start joints
             new_joint_offsets = []
             current_joints = self.get_joint_state()
+            start_joints = np.array(start_joints[:len(current_joints)])
             assert current_joints.shape == start_joints.shape
             if gripper_config is not None:
                 current_joints = current_joints[:-1]
@@ -132,6 +133,40 @@ class DynamixelRobot(Robot):
             return
         self._driver.set_torque_mode(mode)
         self._torque_on = mode
+
+    def start_gravity_compensation(
+        self,
+        xml_path: str,
+        torque_to_pwm=None,
+        hz: float = 50.0,
+    ):
+        """Start gravity compensation using MuJoCo model.
+
+        Args:
+            xml_path: Path to MuJoCo XML (e.g. yam.xml).
+            torque_to_pwm: torque→PWM scale per joint (length 6). Tune if over/under compensating.
+            hz: Control frequency for compensation loop.
+        """
+        from gello.robots.gravity_comp import GravityCompensator, GravityCompThread
+
+        compensator = GravityCompensator(
+            xml_path=xml_path,
+            joint_signs=self._joint_signs[:6].tolist(),
+            joint_offsets=self._joint_offsets[:6].tolist(),
+            torque_to_pwm=torque_to_pwm,
+        )
+        self._gc_thread = GravityCompThread(
+            driver=self._driver,
+            compensator=compensator,
+            get_joints_fn=self._driver.get_joints,
+            n_joints=len(self._joint_ids),
+            hz=hz,
+        )
+        self._gc_thread.start()
+
+    def stop_gravity_compensation(self):
+        if hasattr(self, "_gc_thread"):
+            self._gc_thread.stop()
 
     def get_observations(self) -> Dict[str, np.ndarray]:
         return {"joint_state": self.get_joint_state()}

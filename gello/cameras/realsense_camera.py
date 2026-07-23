@@ -57,31 +57,51 @@ class RealSenseCamera(CameraDriver):
         self.fx, self.fy = intr.fx, intr.fy
         self.cx, self.cy = intr.ppx, intr.ppy
 
+        # 단일 배경 스레드가 프레임을 지속 캐시 — 여러 스레드가 read()를 동시 호출해도 안전
+        self._color_cache: Optional[np.ndarray] = None
+        self._depth_cache: Optional[np.ndarray] = None
+        self._cache_lock = threading.Lock()
+        self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._capture_thread.start()
+        # 첫 프레임 대기
+        for _ in range(300):
+            with self._cache_lock:
+                if self._color_cache is not None:
+                    break
+            time.sleep(0.01)
+
+    def _capture_loop(self):
+        """단일 스레드에서 RealSense 프레임을 지속 수신해 캐시에 저장."""
+        while True:
+            try:
+                frames = self._pipeline.wait_for_frames(timeout_ms=3000)
+                color_frame = frames.get_color_frame()
+                depth_frame = frames.get_depth_frame()
+                if not color_frame or not depth_frame:
+                    continue
+                color = np.asanyarray(color_frame.get_data()).copy()
+                depth = np.asanyarray(depth_frame.get_data()).copy()
+                with self._cache_lock:
+                    self._color_cache = color
+                    self._depth_cache = depth
+                    self._depth_raw = depth
+            except Exception:
+                time.sleep(0.01)
+
     def read(
         self,
-        img_size: Optional[Tuple[int, int]] = None,  # farthest: float = 0.12
+        img_size: Optional[Tuple[int, int]] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Read a frame from the camera.
-
-        Args:
-            img_size: The size of the image to return. If None, the original size is returned.
-            farthest: The farthest distance to map to 255.
-
-        Returns:
-            np.ndarray: The color image, shape=(H, W, 3)
-            np.ndarray: The depth image, shape=(H, W, 1)
-        """
+        """캐시된 최신 프레임을 반환. 여러 스레드에서 동시 호출 안전."""
         import cv2
 
-        with self._lock:
-            frames = self._pipeline.wait_for_frames(timeout_ms=3000)
-            color_frame = frames.get_color_frame()
-            color_image = np.asanyarray(color_frame.get_data()).copy()
-            depth_frame = frames.get_depth_frame()
-            depth_image = np.asanyarray(depth_frame.get_data()).copy()
-
-        # 원본 해상도 depth 보존 (3D 변환용)
-        self._depth_raw = depth_image  # (480, 640) uint16, mm 단위
+        while True:
+            with self._cache_lock:
+                if self._color_cache is not None:
+                    color_image = self._color_cache.copy()
+                    depth_image = self._depth_cache.copy()
+                    break
+            time.sleep(0.005)
 
         if img_size is None:
             image = color_image[:, :, ::-1]
@@ -90,7 +110,6 @@ class RealSenseCamera(CameraDriver):
             image = cv2.resize(color_image, img_size)[:, :, ::-1]
             depth = cv2.resize(depth_image, img_size)
 
-        # rotate 180 degree's because everything is upside down in order to center the camera
         if self._flip:
             image = cv2.rotate(image, cv2.ROTATE_180)
             depth = cv2.rotate(depth, cv2.ROTATE_180)[:, :, None]
@@ -101,13 +120,14 @@ class RealSenseCamera(CameraDriver):
 
     def pixel_to_3d(self, u: int, v: int) -> np.ndarray:
         """픽셀 좌표 (u, v)를 카메라 프레임의 3D 좌표(미터)로 변환."""
-        if not hasattr(self, '_depth_raw') or self._depth_raw is None:
+        src = getattr(self, '_depth_raw', None)
+        if src is None:
             return np.zeros(3, dtype=np.float32)
-        h, w = self._depth_raw.shape[:2]
+        h, w = src.shape[:2]
         u = int(np.clip(u, 0, w - 1))
         v = int(np.clip(v, 0, h - 1))
-        d = self._depth_raw[v, u] * self.depth_scale  # meters
-        if d <= 0.01 or d > 2.0:  # 유효 범위 밖
+        d = float(src[v, u]) * self.depth_scale  # meters
+        if d <= 0.01 or d > 2.0:
             return np.zeros(3, dtype=np.float32)
         x = (u - self.cx) * d / self.fx
         y = (v - self.cy) * d / self.fy

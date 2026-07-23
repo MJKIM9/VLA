@@ -33,6 +33,10 @@ LEN_PRESENT_VELOCITY = 4
 ADDR_OPERATING_MODE = 11
 CURRENT_CONTROL_MODE = 0
 POSITION_CONTROL_MODE = 3
+PWM_CONTROL_MODE = 16
+ADDR_GOAL_PWM = 100
+LEN_GOAL_PWM = 2
+PWM_MAX = 885
 
 # Servo-specific mappings and limits
 TORQUE_TO_CURRENT_MAPPING = {
@@ -62,6 +66,10 @@ class DynamixelDriverProtocol(Protocol):
 
     def set_torque(self, torques: Sequence[float]):
         """Set joint torques (Nm), mapped to motor currents using servo mappings."""
+        ...
+
+    def set_pwm(self, pwm_values: Sequence[float]):
+        """Set PWM values (-885 to 885) for PWM control mode."""
         ...
 
     def set_operating_mode(self, mode: int):
@@ -119,18 +127,21 @@ class FakeDynamixelDriver(DynamixelDriverProtocol):
             )
         if not self._torque_enabled:
             raise RuntimeError("Torque must be enabled to set joint angles")
-        self._joint_angles = np.array(joint_angles, dtype=float)
+        self._joint_angles = np.array(joint_angles, dtype=float)  # type: ignore[assignment]
 
     def set_current(self, currents: Sequence[float]):
         if len(currents) != len(self._ids):
             raise ValueError("The length of currents must match the number of servos")
         if not self._torque_enabled:
             raise RuntimeError("Torque must be enabled to set currents")
-        self._currents = np.array(currents, dtype=float)
+        self._currents = np.array(currents, dtype=float)  # type: ignore[assignment]
 
     def set_torque(self, torques: Sequence[float]):
         # For fake driver, treat torques as currents for storage
         self.set_current(torques)
+
+    def set_pwm(self, pwm_values: Sequence[float]):
+        pass  # No-op for fake driver
 
     def set_operating_mode(self, mode: int):
         pass
@@ -178,8 +189,8 @@ class DynamixelDriver(DynamixelDriverProtocol):
             use_fake_fallback (bool): Whether to fallback to FakeDynamixelDriver on failure.
         """
         self._ids = ids
-        self._joint_angles = None
-        self._velocities = None
+        self._joint_angles: Optional[np.ndarray] = None
+        self._velocities: Optional[np.ndarray] = None
         self._lock = Lock()
         self._port = port
         self._baudrate = baudrate
@@ -192,10 +203,10 @@ class DynamixelDriver(DynamixelDriverProtocol):
         # Optional torque-current mapping
         self._servo_types = list(servo_types) if servo_types is not None else None
         if self._servo_types is not None:
-            self.torque_to_current_map = np.array(
+            self.torque_to_current_map: Optional[np.ndarray] = np.array(
                 [TORQUE_TO_CURRENT_MAPPING[s] for s in self._servo_types]
             )
-            self.current_limits = np.array(
+            self.current_limits: Optional[np.ndarray] = np.array(
                 [SERVO_CURRENT_LIMITS[s] for s in self._servo_types]
             )
         else:
@@ -268,6 +279,12 @@ class DynamixelDriver(DynamixelDriverProtocol):
             self._packetHandler,
             ADDR_GOAL_CURRENT,
             LEN_GOAL_CURRENT,
+        )
+        self._groupSyncWritePWM = GroupSyncWrite(
+            self._portHandler,
+            self._packetHandler,
+            ADDR_GOAL_PWM,
+            LEN_GOAL_PWM,
         )
 
         # Open the port and set the baudrate
@@ -388,6 +405,24 @@ class DynamixelDriver(DynamixelDriverProtocol):
         currents = (self.torque_to_current_map * torques_array).tolist()
         self.set_current(currents)
 
+    def set_pwm(self, pwm_values: Sequence[float]):
+        if self._is_fake:
+            return
+        if not self._torque_enabled:
+            raise RuntimeError("Torque must be enabled to set PWM")
+
+        pwm_array = np.clip(np.array(pwm_values), -PWM_MAX, PWM_MAX).astype(int)
+
+        with self._lock:
+            for dxl_id, pwm in zip(self._ids, pwm_array.tolist()):
+                param = [DXL_LOBYTE(pwm & 0xFFFF), DXL_HIBYTE(pwm & 0xFFFF)]
+                if not self._groupSyncWritePWM.addParam(dxl_id, param):
+                    raise RuntimeError(f"Failed to set PWM for Dynamixel ID {dxl_id}")
+            dxl_comm_result = self._groupSyncWritePWM.txPacket()
+            if dxl_comm_result != COMM_SUCCESS:
+                raise RuntimeError("Failed to syncwrite PWM")
+            self._groupSyncWritePWM.clearParam()
+
     def torque_enabled(self) -> bool:
         return self._torque_enabled
 
@@ -414,6 +449,9 @@ class DynamixelDriver(DynamixelDriverProtocol):
     def set_operating_mode(self, mode: int):
         if self._is_fake:
             return
+        # Pause reading thread and wait for it to release the lock
+        self._stop_thread.set()
+        time.sleep(0.3)
         with self._lock:
             for dxl_id in self._ids:
                 dxl_comm_result, dxl_error = self._packetHandler.write1ByteTxRx(
@@ -421,8 +459,12 @@ class DynamixelDriver(DynamixelDriverProtocol):
                 )
                 if dxl_comm_result != COMM_SUCCESS or dxl_error != 0:
                     raise RuntimeError(
-                        f"Failed to set operating mode for Dynamixel with ID {dxl_id}"
+                        f"Failed to set operating mode for Dynamixel with ID {dxl_id} "
+                        f"(comm={dxl_comm_result}, err={dxl_error})"
                     )
+        # Restart reading thread
+        self._stop_thread.clear()
+        self._start_reading_thread()
 
     def verify_operating_mode(self, expected_mode: int):
         if self._is_fake:
@@ -457,39 +499,41 @@ class DynamixelDriver(DynamixelDriverProtocol):
                 if dxl_comm_result != COMM_SUCCESS:
                     print(f"warning, comm failed: {dxl_comm_result}")
                     continue
-                for i, dxl_id in enumerate(self._ids):
-                    # velocity
-                    if self._groupSyncRead.isAvailable(
-                        dxl_id, ADDR_PRESENT_VELOCITY, LEN_PRESENT_VELOCITY
-                    ):
-                        velocity = self._groupSyncRead.getData(
+                try:
+                    for i, dxl_id in enumerate(self._ids):
+                        # velocity
+                        if self._groupSyncRead.isAvailable(
                             dxl_id, ADDR_PRESENT_VELOCITY, LEN_PRESENT_VELOCITY
-                        )
-                        # sign correction for 32-bit two's complement
-                        if velocity > 0x7FFFFFFF:
-                            velocity -= 0x100000000
-                        _velocities[i] = velocity
-                    else:
-                        raise RuntimeError(
-                            f"Failed to get velocity for Dynamixel with ID {dxl_id}"
-                        )
-                    # position
-                    if self._groupSyncRead.isAvailable(
-                        dxl_id, ADDR_PRESENT_POSITION, LEN_PRESENT_POSITION
-                    ):
-                        angle = self._groupSyncRead.getData(
+                        ):
+                            velocity = self._groupSyncRead.getData(
+                                dxl_id, ADDR_PRESENT_VELOCITY, LEN_PRESENT_VELOCITY
+                            )
+                            if velocity > 0x7FFFFFFF:
+                                velocity -= 0x100000000
+                            _velocities[i] = velocity
+                        else:
+                            raise RuntimeError(
+                                f"Failed to get velocity for Dynamixel with ID {dxl_id}"
+                            )
+                        # position
+                        if self._groupSyncRead.isAvailable(
                             dxl_id, ADDR_PRESENT_POSITION, LEN_PRESENT_POSITION
-                        )
-                        # sign correction for 32-bit two's complement
-                        if angle > 0x7FFFFFFF:
-                            angle -= 0x100000000
-                        _joint_angles[i] = angle
-                    else:
-                        raise RuntimeError(
-                            f"Failed to get joint angles for Dynamixel with ID {dxl_id}"
-                        )
-                self._joint_angles = _joint_angles
-                self._velocities = _velocities
+                        ):
+                            angle = self._groupSyncRead.getData(
+                                dxl_id, ADDR_PRESENT_POSITION, LEN_PRESENT_POSITION
+                            )
+                            if angle > 0x7FFFFFFF:
+                                angle -= 0x100000000
+                            _joint_angles[i] = angle
+                        else:
+                            raise RuntimeError(
+                                f"Failed to get joint angles for Dynamixel with ID {dxl_id}"
+                            )
+                    self._joint_angles = _joint_angles
+                    self._velocities = _velocities
+                except Exception as e:
+                    # 불완전한 패킷 → 이전 값 유지하고 계속
+                    pass
             # self._groupSyncRead.clearParam()
 
     def get_positions_and_velocities(self) -> Tuple[np.ndarray, np.ndarray]:

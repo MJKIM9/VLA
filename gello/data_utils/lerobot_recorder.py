@@ -174,6 +174,16 @@ class LeRobotRecorder:
                 import traceback
                 print(f"[Recorder] save_episode 실패: {e}")
                 traceback.print_exc()
+                # save 실패 후 episode_buffer에 size 키가 없을 수 있음
+                # (save_episode 내부에서 pop("size") 후 exception 발생 시)
+                # 다음 에피소드 수집을 위해 buffer 초기화
+                try:
+                    self.dataset.clear_episode_buffer()
+                except Exception:
+                    try:
+                        self.dataset.episode_buffer = self.dataset.create_episode_buffer()
+                    except Exception:
+                        self.dataset.episode_buffer = None
         else:
             self.dataset.clear_episode_buffer()
             print("Episode discarded.")

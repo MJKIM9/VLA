@@ -1,7 +1,7 @@
 import importlib
 import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, cast
 
 import numpy as np
 from omegaconf import OmegaConf
@@ -20,7 +20,7 @@ class SimpleLaunchManager:
 
     def _load_config(self) -> Dict[str, Any]:
         """Load and resolve configuration."""
-        cfg = OmegaConf.to_container(OmegaConf.load(self.config_path), resolve=True)
+        cfg = cast(Dict[str, Any], OmegaConf.to_container(OmegaConf.load(self.config_path), resolve=True))
 
         # Handle robot config
         robot_cfg = cfg["robot"]
@@ -101,6 +101,7 @@ class SimpleLaunchManager:
 
     def move_to_joints(self, joints: np.ndarray):
         """Move robot to specified joints."""
+        assert self.env is not None, "env must be set before calling move_to_joints"
         for jnt in np.linspace(self.env.get_obs()["joint_positions"], joints, 100):
             self.env.step(jnt)
             time.sleep(0.001)
@@ -202,7 +203,7 @@ def move_to_start_position(
 ):
     """Move robot to start position if specified."""
     if bimanual:
-        if right_cfg is None:
+        if right_cfg is None or left_cfg is None:
             return
         left_start = left_cfg["agent"].get("start_joints")
         right_start = right_cfg["agent"].get("start_joints")
@@ -210,6 +211,8 @@ def move_to_start_position(
             return
         reset_joints = np.concatenate([np.array(left_start), np.array(right_start)])
     else:
+        if left_cfg is None:
+            return
         if (
             "start_joints" not in left_cfg["agent"]
             or left_cfg["agent"]["start_joints"] is None
@@ -217,7 +220,7 @@ def move_to_start_position(
             return
         reset_joints = np.array(left_cfg["agent"]["start_joints"])
 
-    curr_joints = env.get_obs()["joint_positions"]
+    curr_joints = np.array(env.get_obs()["joint_positions"])
     if reset_joints.shape != curr_joints.shape:
         print("Warning: Mismatch in joint shapes, skipping move_to_start_position.")
         return

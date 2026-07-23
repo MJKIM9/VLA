@@ -138,6 +138,7 @@ def run_control_loop(
     save_interface: Optional[SaveInterface] = None,
     print_timing: bool = True,
     use_colors: bool = False,
+    teleop_active: Optional["threading.Event"] = None,
 ) -> None:
     """Run the main control loop.
 
@@ -177,6 +178,10 @@ def run_control_loop(
                 )
             else:
                 print(message, end="", flush=True)
+
+        if teleop_active is not None and not teleop_active.is_set():
+            time.sleep(1.0 / 30)
+            continue
 
         action = agent.act(obs)
 

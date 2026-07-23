@@ -32,14 +32,17 @@ class ZMQServerRobot:
         self._socket.setsockopt(zmq.RCVTIMEO, 1000)  # Set timeout to 1000 ms
         while not self._stop_event.is_set():
             try:
-                # Wait for next request from client
                 message = self._socket.recv()
-                request = pickle.loads(message)
+            except zmq.Again:
+                continue
+            except Exception as e:
+                print(f"[ZMQServer] recv error: {e}")
+                continue
 
-                # Call the appropriate method based on the request
+            try:
+                request = pickle.loads(message)
                 method = request.get("method")
                 args = request.get("args", {})
-                result: Any
                 if method == "num_dofs":
                     result = self._robot.num_dofs()
                 elif method == "get_joint_state":
@@ -49,16 +52,15 @@ class ZMQServerRobot:
                 elif method == "get_observations":
                     result = self._robot.get_observations()
                 else:
-                    result = {"error": "Invalid method"}
-                    print(result)
-                    raise NotImplementedError(
-                        f"Invalid method: {method}, {args, result}"
-                    )
+                    result = {"error": f"Invalid method: {method}"}
+            except Exception as e:
+                # 로봇 메서드 예외를 클라이언트에 전달 (서버 스레드 죽지 않음)
+                result = {"error": str(e)}
 
+            try:
                 self._socket.send(pickle.dumps(result))
-            except zmq.Again:
-                # Timeout occurred - don't spam the console
-                pass
+            except Exception as e:
+                print(f"[ZMQServer] send error: {e}")
 
     def stop(self) -> None:
         """Signal the server to stop serving."""
@@ -113,9 +115,14 @@ class ZMQClientRobot(Robot):
             "args": {"joint_state": joint_state},
         }
         send_message = pickle.dumps(request)
-        self._socket.send(send_message)
-        result = pickle.loads(self._socket.recv())
-        return result
+        try:
+            self._socket.send(send_message)
+            result = pickle.loads(self._socket.recv())
+            if isinstance(result, dict) and "error" in result:
+                raise RuntimeError(result["error"])
+            return result
+        except zmq.Again:
+            raise RuntimeError("ZMQ timeout - robot may be disconnected")
 
     def get_observations(self) -> Dict[str, np.ndarray]:
         """Get the current observations of the leader robot.

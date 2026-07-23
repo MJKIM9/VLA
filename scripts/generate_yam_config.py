@@ -89,7 +89,7 @@ def get_joint_offsets(
 ) -> Tuple[list, Optional[Tuple[float, float]]]:
     """Get joint offsets using the same logic as gello_get_offset.py."""
     joint_ids = list(range(1, args.num_joints + 1))
-    driver = DynamixelDriver(joint_ids, port=port, baudrate=57600)
+    driver = DynamixelDriver(joint_ids, port=port, baudrate=4000000)
 
     def get_error(offset: float, index: int, joint_state: np.ndarray) -> float:
         joint_sign_i = args.joint_signs[index]
