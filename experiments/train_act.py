@@ -44,36 +44,31 @@ class Args:
     chunk_size: int = 50
     """ACT action chunk size (frames to predict at once)."""
 
-    camera_keys: str = "observation.images.wrist,observation.images.exterior"
-    """Comma-separated camera feature keys."""
-
 
 def main():
     args = tyro.cli(Args)
     dataset_dir = str(Path(args.dataset_dir).expanduser())
     output_dir = str(Path(args.output_dir).expanduser())
 
-    camera_keys = args.camera_keys.split(",")
-
-    # Build LeRobot train command
-    # lerobot_train.py uses Hydra config overrides
+    # 설치된 lerobot 버전은 tyro 기반 CLI (--key.subkey 형식)를 사용.
+    # 카메라 입력 shape은 데이터셋 메타데이터에서 자동 추론되므로 별도 지정 불필요.
     cmd = [
         sys.executable, "-m", "lerobot.scripts.lerobot_train",
-        f"--config-name=act",
-        f"dataset.repo_id={args.repo_id}",
-        f"dataset.root={dataset_dir}",
-        f"training.output_dir={output_dir}",
-        f"training.batch_size={args.batch_size}",
-        f"training.num_workers={args.num_workers}",
-        f"training.offline_steps={args.steps}",
-        f"training.save_freq={args.save_freq}",
-        f"training.lr={args.lr}",
-        f"policy.chunk_size={args.chunk_size}",
+        f"--dataset.repo_id={args.repo_id}",
+        f"--dataset.root={dataset_dir}",
+        "--policy.type=act",
+        f"--policy.chunk_size={args.chunk_size}",
+        # n_action_steps는 chunk_size 이하여야 함 (ACTConfig 제약) — 기본은 동일하게 맞춤
+        f"--policy.n_action_steps={args.chunk_size}",
+        f"--output_dir={output_dir}",
+        f"--batch_size={args.batch_size}",
+        f"--num_workers={args.num_workers}",
+        f"--steps={args.steps}",
+        f"--save_freq={args.save_freq}",
+        f"--optimizer.lr={args.lr}",
+        "--wandb.enable=false",
+        "--policy.push_to_hub=false",
     ]
-
-    # Add camera image keys to policy config
-    for i, key in enumerate(camera_keys):
-        cmd.append(f"policy.input_shapes.{key}=[3,480,640]")
 
     print("Starting ACT training...")
     print(f"Dataset : {dataset_dir}")

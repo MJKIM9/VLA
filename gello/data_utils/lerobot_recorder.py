@@ -5,6 +5,29 @@ from typing import Dict, List, Optional
 import numpy as np
 
 
+def _patch_compute_stats_0d_bug():
+    """lerobot 버그 우회: 어떤 feature의 에피소드 배열이 0차원(스칼라)이 되면
+    compute_episode_stats() 내부의 array.shape[0] 접근이 IndexError로 죽으면서
+    save_episode() 전체가 실패하고(에피소드 데이터가 디스크에 전혀 안 쓰임) 통째로 유실된다.
+    0차원 배열을 1차원으로 강제 변환한 뒤 원래 로직을 타도록 감싸서 이 유실을 막는다."""
+    import lerobot.datasets.compute_stats as _cs
+
+    if getattr(_cs, "_gello_0d_patch_applied", False):
+        return
+    _orig_prepare = _cs._prepare_array_for_stats
+
+    def _safe_prepare_array_for_stats(array, axis):
+        if getattr(array, "ndim", None) == 0:
+            array = array.reshape(1)
+        return _orig_prepare(array, axis)
+
+    _cs._prepare_array_for_stats = _safe_prepare_array_for_stats
+    _cs._gello_0d_patch_applied = True
+
+
+_patch_compute_stats_0d_bug()
+
+
 def make_lerobot_dataset(
     repo_id: str,
     root: str,
@@ -134,12 +157,20 @@ class LeRobotRecorder:
         for key, img in images.items():
             frame[f"observation.images.{key}"] = img  # (H, W, 3) uint8
 
+        # lerobot 라이브러리 버그 우회: episode_buffer["episode_index"]가 numpy 배열이 되면
+        # add_frame 내부에서 경로 포맷팅(f"{episode_index:06d}") 시 TypeError 발생.
+        # clear_episode_buffer()가 하는 것과 동일하게 스칼라로 강제 변환해둔다.
+        eb = getattr(self.dataset, "episode_buffer", None)
+        if eb is not None and isinstance(eb.get("episode_index"), np.ndarray):
+            arr = eb["episode_index"]
+            eb["episode_index"] = arr.item() if arr.size == 1 else arr[0]
+
         self.dataset.add_frame(frame)
 
-    def end_episode(self, save: bool = True, record_queue=None):
-        """Finalize the current episode."""
+    def end_episode(self, save: bool = True, record_queue=None) -> bool:
+        """Finalize the current episode. Returns True on successful save (or discard), False on save failure."""
         if not self._recording:
-            return
+            return False
 
         self._recording = False  # 새 프레임이 큐에 추가되는 것을 막음
 
@@ -170,6 +201,7 @@ class LeRobotRecorder:
                     print(f"[Recorder] meta flush warning: {e}")
                 self._episode_count += 1
                 print(f"Saved. Total episodes: {self._episode_count}")
+                return True
             except Exception as e:
                 import traceback
                 print(f"[Recorder] save_episode 실패: {e}")
@@ -184,9 +216,11 @@ class LeRobotRecorder:
                         self.dataset.episode_buffer = self.dataset.create_episode_buffer()
                     except Exception:
                         self.dataset.episode_buffer = None
+                return False
         else:
             self.dataset.clear_episode_buffer()
             print("Episode discarded.")
+            return True
 
     def close(self):
         """Flush and close parquet writers. Call once when recording session is complete."""

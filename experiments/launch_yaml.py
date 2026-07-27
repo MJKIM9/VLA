@@ -48,6 +48,30 @@ def _detect_color_centroid(img_bgr, lower_hsv, upper_hsv):
     return cx, cy
 
 
+def _detect_color_blobs(img_bgr, lower_hsv, upper_hsv):
+    """HSV 범위로 검출된 픽셀을 개별 blob(connected component) 단위로 분리해
+    각 blob의 중심 좌표와 면적을 반환. x좌표(왼쪽→오른쪽) 순으로 정렬된 리스트."""
+    import cv2 as _cv2
+    import numpy as _np2
+    hsv = _cv2.cvtColor(img_bgr, _cv2.COLOR_BGR2HSV)
+    mask = _cv2.inRange(hsv, _np2.array(lower_hsv), _np2.array(upper_hsv))
+    mask = _cv2.erode(mask, None, iterations=2)
+    mask = _cv2.dilate(mask, None, iterations=2)
+    _, _w = mask.shape
+    mask[:, :int(_w * _COLOR_ROI_LEFT)]  = 0
+    mask[:, int(_w * _COLOR_ROI_RIGHT):] = 0
+    n_labels, _labels, stats, centroids = _cv2.connectedComponentsWithStats(mask, connectivity=8)
+    blobs = []
+    for i in range(1, n_labels):  # 0번 라벨은 배경
+        area = stats[i, _cv2.CC_STAT_AREA]
+        if area < _MIN_AREA_COLOR:
+            continue
+        cx, cy = centroids[i]
+        blobs.append({"cx": int(cx), "cy": int(cy), "area": int(area)})
+    blobs.sort(key=lambda b: b["cx"])
+    return blobs
+
+
 def _detect_cable_tip(img_bgr):
     """케이블(검정) ROI 적용 후 하단 tip 픽셀 좌표 반환. 검출 실패 시 None."""
     import cv2 as _cv2
@@ -98,6 +122,7 @@ def compute_alignment_xyz(img_bgr, wrist_cam):
 # Global variables for cleanup
 active_threads: List[threading.Thread] = []
 active_servers: List[Any] = []
+active_recorder: List[Any] = [None]  # signal_handler에서 recorder를 안전하게 닫기 위한 참조
 cleanup_in_progress = False
 
 
@@ -109,6 +134,18 @@ def cleanup():
     cleanup_in_progress = True
 
     print("Cleaning up resources...")
+    # recorder를 먼저 닫아 meta parquet writer의 footer를 반드시 기록한다.
+    # (Ctrl+C 등으로 os._exit() 호출 시 atexit/finally가 스킵되어 이게 없으면
+    #  녹화 중이던 에피소드의 메타데이터 파일이 미완성 상태로 남아 다음 로드 시 손상됨)
+    if active_recorder[0] is not None:
+        try:
+            if active_recorder[0].is_recording:
+                active_recorder[0].end_episode(save=True)
+            active_recorder[0].close()
+            print("Recorder closed.")
+        except Exception as e:
+            print(f"Error closing recorder: {e}")
+
     for server in active_servers:
         try:
             if hasattr(server, "close"):
@@ -210,6 +247,8 @@ def main():
     gc_cfg         = left_cfg.get("gravity_comp", {})
     dataset_cfg    = left_cfg.get("dataset", {})
     vla_cfg        = left_cfg.get("vla", {})
+    datasets_root_dir    = left_cfg.get("datasets_root_dir", "~/datasets")
+    checkpoints_root_dir = left_cfg.get("checkpoints_root_dir", "~/checkpoints")
 
     # Create one shared DATCGripper instance and inject into robot
     gripper = None
@@ -346,23 +385,28 @@ def main():
     # LeRobot recorder (카메라 없이도 state/action 저장 가능)
     recorder = None
     cameras = {}
+    set_dataset_fn = None
+    _current_dataset_name = None
     _cartesian_action = dataset_cfg.get("cartesian_action", False)
     if dataset_cfg.get("dir"):
         from gello.data_utils.lerobot_recorder import LeRobotRecorder, make_lerobot_dataset
         from gello.cameras.realsense_camera import get_device_ids, RealSenseCamera
 
+        _use_exterior_camera = dataset_cfg.get("use_exterior_camera", True)
         device_ids = get_device_ids()
-        if len(device_ids) >= 2:
+        if len(device_ids) >= 2 and _use_exterior_camera:
             cameras = {
                 "exterior": RealSenseCamera(device_id=device_ids[0]),
                 "wrist":    RealSenseCamera(device_id=device_ids[1]),
             }
-        elif len(device_ids) == 1:
-            cameras = {"wrist": RealSenseCamera(device_id=device_ids[0])}
+        elif len(device_ids) >= 1:
+            # exterior 미사용 또는 카메라 1대만 연결된 경우: wrist만 사용
+            wrist_device_id = device_ids[1] if len(device_ids) >= 2 else device_ids[0]
+            cameras = {"wrist": RealSenseCamera(device_id=wrist_device_id)}
 
-        # state = tcp_xyz_delta(3) + tcp_rpy(3) + gripper(1) + align_xy(2) = 9
-        # action = tcp_xyz_delta(3) + tcp_rpy_delta(3) + gripper(1) = 7  (cartesian_action=True)
-        #        = joint_delta(7)                                         (cartesian_action=False)
+        # state = tcp_xyz_delta(3) + tcp_rotvec(3) + gripper(1) + align_xy(2) = 9
+        # action = tcp_xyz_delta(3) + tcp_rotvec_delta(3) + gripper_delta(1) = 7  (cartesian_action=True)
+        #        = joint_delta(7)                                                  (cartesian_action=False)
         STATE_DIM  = 3 + 3 + 1 + 2
         ACTION_DIM = 7 if _cartesian_action else left_robot.num_dofs()
         dataset = make_lerobot_dataset(
@@ -377,10 +421,127 @@ def main():
             dataset=dataset,
             task=dataset_cfg.get("task_name", "teleoperation"),
         )
+        active_recorder[0] = recorder
+        _current_dataset_name = Path(dataset_cfg["dir"]).expanduser().name
+
+        def set_dataset_fn(dataset_name: str):
+            """UI에서 데이터셋 선택 시 호출. recorder를 새 데이터셋으로 교체하고 yaml에도 반영."""
+            nonlocal recorder
+            if recorder is not None and recorder.is_recording:
+                print("[Dataset] 녹화 중에는 데이터셋을 변경할 수 없습니다.")
+                return
+            try:
+                new_root = Path(datasets_root_dir).expanduser() / dataset_name
+                new_repo_id = f"koras/{dataset_name}"
+                new_dataset = make_lerobot_dataset(
+                    repo_id=new_repo_id,
+                    root=str(new_root),
+                    fps=int(cfg.get("hz", 30)),
+                    state_dim=STATE_DIM,
+                    action_dim=ACTION_DIM,
+                    camera_keys=list(cameras.keys()),
+                )
+                if recorder is not None:
+                    try:
+                        recorder.close()
+                    except Exception:
+                        pass
+                recorder = LeRobotRecorder(
+                    dataset=new_dataset,
+                    task=dataset_cfg.get("task_name", "teleoperation"),
+                )
+                active_recorder[0] = recorder
+                panel.set_recorder(recorder)
+                dataset_cfg["dir"] = str(new_root)
+                dataset_cfg["repo_id"] = new_repo_id
+                try:
+                    _update_yaml_scalar(args.left_config_path, "dir", f"~/datasets/{dataset_name}")
+                    _update_yaml_scalar(args.left_config_path, "repo_id", new_repo_id)
+                except Exception as e:
+                    print(f"[Dataset] yaml 저장 실패: {e}")
+                print(f"[Dataset] 활성 데이터셋 변경: {dataset_name}")
+            except Exception as e:
+                print(f"[Dataset] 변경 실패: {e}")
 
     # VLA 정책은 버튼 클릭 시 lazy-load (CUDA init 전에 fork하면 segfault 발생)
     vla_demo_fn = None
+    set_checkpoint_fn = None
     _vla_policy = [None]  # lazy-load용 컨테이너
+
+    def _update_yaml_scalar(yaml_path: str, key: str, value) -> bool:
+        """yaml 파일에서 key: 값을 주석/포맷 보존하며 갱신. 찾으면 True."""
+        import re
+        with open(yaml_path, "r") as f:
+            text = f.read()
+        if isinstance(value, bool):
+            val_str = "true" if value else "false"
+        elif isinstance(value, float):
+            val_str = repr(value)
+        else:
+            val_str = str(value)
+        pattern = re.compile(rf"^(\s*){re.escape(key)}:\s*[^\n#]*(#.*)?$", re.MULTILINE)
+
+        def _repl(m):
+            comment = m.group(2) or ""
+            sep = "  " if comment else ""
+            return f"{m.group(1)}{key}: {val_str}{sep}{comment}"
+
+        new_text, n = pattern.subn(_repl, text, count=1)
+        if n == 0:
+            return False
+        with open(yaml_path, "w") as f:
+            f.write(new_text)
+        return True
+
+    def set_vla_params_fn(new_values: dict):
+        """UI에서 파라미터 적용 시 호출. vla_cfg를 갱신하고 yaml 파일에도 반영해 재시작 후에도 유지되게 한다."""
+        vla_cfg.update(new_values)
+        for key, value in new_values.items():
+            try:
+                if not _update_yaml_scalar(args.left_config_path, key, value):
+                    print(f"[VLA] yaml에서 '{key}' 키를 찾지 못해 파일에는 반영 못함 (메모리에는 반영됨)")
+            except Exception as e:
+                print(f"[VLA] yaml 저장 실패 ({key}): {e}")
+        print(f"[VLA] 파라미터 업데이트: {new_values}")
+
+    _train_scripts_dir = Path(__file__).resolve().parent
+
+    def start_act_training_fn(params: dict):
+        """UI에서 'Start ACT Training' 클릭 시 호출. 별도 프로세스로 학습을 백그라운드 시작."""
+        import subprocess, sys
+        dataset_name = params["dataset_name"]
+        cmd = [
+            sys.executable, str(_train_scripts_dir / "train_act.py"),
+            "--repo_id", f"koras/{dataset_name}",
+            "--dataset_dir", str(Path(datasets_root_dir).expanduser() / dataset_name),
+            "--output_dir", str(Path(checkpoints_root_dir).expanduser() / params["output_name"]),
+            "--batch_size", str(params["batch_size"]),
+            "--num_workers", str(params["num_workers"]),
+            "--steps", str(params["steps"]),
+            "--save_freq", str(params["save_freq"]),
+            "--lr", str(params["lr"]),
+            "--chunk_size", str(params["chunk_size"]),
+        ]
+        print(f"[Train:ACT] 실행: {' '.join(cmd)}")
+        subprocess.Popen(cmd)
+        print("[Train:ACT] 백그라운드에서 학습을 시작했습니다. 진행 상황은 터미널 로그를 확인하세요.")
+
+    def start_align_training_fn(params: dict):
+        """UI에서 'Start Align Training' 클릭 시 호출. 별도 프로세스로 학습을 백그라운드 시작."""
+        import subprocess, sys
+        dataset_name = params["dataset_name"]
+        cmd = [
+            sys.executable, str(_train_scripts_dir / "train_align.py"),
+            "--dataset_dir", str(Path(datasets_root_dir).expanduser() / dataset_name),
+            "--output_path", str(Path(checkpoints_root_dir).expanduser() / params["output_name"]),
+            "--fine_threshold", str(params["fine_threshold"]),
+            "--epochs", str(params["epochs"]),
+            "--batch_size", str(params["batch_size"]),
+            "--lr", str(params["lr"]),
+        ]
+        print(f"[Train:Align] 실행: {' '.join(cmd)}")
+        subprocess.Popen(cmd)
+        print("[Train:Align] 백그라운드에서 학습을 시작했습니다. 진행 상황은 터미널 로그를 확인하세요.")
 
     # Teleoperation toggle event (set = active); starts OFF
     teleop_event = threading.Event()
@@ -413,21 +574,33 @@ def main():
                 # state: 9-dim (align_xy[:2]만 포함, 추론 obs_to_tensor와 일치)
                 state = _np.concatenate([
                     obs_snap["tcp_xyz_delta"],
-                    obs_snap["tcp_rpy"],
+                    obs_snap[left_robot.state_orientation_key()],
                     obs_snap["gripper_position"],
                     align_xyz[:2],
                 ])
                 if _cartesian_action:
-                    # Cartesian action: FK(GELLO) - FK(UR) in xyz + gripper delta
+                    # Cartesian action: FK(GELLO) - FK(UR)의 xyz 델타 + 회전 델타 + 그리퍼 델타
+                    # 회전 델타 방식은 left_robot.uses_rotvec_action_delta()로 결정
+                    # (v20: 회전행렬 합성 기반 rotvec 델타 / v19: RPY 성분별 차)
                     try:
                         gello_fk = left_robot.robot.getForwardKinematics(action_snap[:6].tolist())
                         ur_fk = left_robot.robot.getForwardKinematics(obs_snap["joint_positions"][:6].tolist())
                         xyz_delta_act = _np.array(gello_fk[:3]) - _np.array(ur_fk[:3])
+                        if left_robot.uses_rotvec_action_delta():
+                            from scipy.spatial.transform import Rotation as _RotRW
+                            R_ur = _RotRW.from_rotvec(ur_fk[3:6]).as_matrix()
+                            R_gello = _RotRW.from_rotvec(gello_fk[3:6]).as_matrix()
+                            rot_delta_act = _RotRW.from_matrix(R_gello @ R_ur.T).as_rotvec()
+                        else:
+                            from gello.robots.ur import _rotvec_to_rpy
+                            gello_rpy = _rotvec_to_rpy(_np.array(gello_fk[3:6]))
+                            ur_rpy = _rotvec_to_rpy(_np.array(ur_fk[3:6]))
+                            rot_delta_act = gello_rpy - ur_rpy
                         gripper_delta_act = _np.array([action_snap[-1] - obs_snap["joint_positions"][-1]])
-                        delta_action = _np.concatenate([xyz_delta_act, gripper_delta_act])
+                        delta_action = _np.concatenate([xyz_delta_act, rot_delta_act, gripper_delta_act])
                     except Exception as _fk_e:
                         print(f"[RecordWorker] FK 실패: {_fk_e}, zero action 사용")
-                        delta_action = _np.zeros(4, dtype=_np.float32)
+                        delta_action = _np.zeros(7, dtype=_np.float32)
                 else:
                     # joint space action (v17 방식)
                     delta_action = action_snap - obs_snap["joint_positions"]
@@ -554,14 +727,32 @@ def main():
         from run_vla import load_policy, run_inference
         import torch as _torch
         _vla_device = "cuda" if _torch.cuda.is_available() else "cpu"
-        _vla_checkpoint = str(Path(vla_cfg["checkpoint"]).expanduser())
+        _vla_checkpoint = [str(Path(vla_cfg["checkpoint"]).expanduser())]  # UI에서 교체 가능한 컨테이너
         _vla_stats = [None]
+
+        def set_checkpoint_fn(pretrained_model_path: str):
+            """UI에서 체크포인트 선택 시 호출. 다음 VLA Demo 실행 시 새로 로드되며 yaml에도 반영."""
+            if not _vla_stop.is_set():
+                print("[VLA] 추론 실행 중에는 체크포인트를 변경할 수 없습니다.")
+                return
+            _vla_checkpoint[0] = pretrained_model_path
+            _vla_policy[0] = None
+            _vla_stats[0] = None
+            vla_cfg["checkpoint"] = pretrained_model_path
+            try:
+                _update_yaml_scalar(args.left_config_path, "checkpoint", pretrained_model_path)
+            except Exception as e:
+                print(f"[VLA] yaml 저장 실패: {e}")
+            print(f"[VLA] 체크포인트 선택됨: {pretrained_model_path} (다음 실행 시 로드)")
 
         def vla_demo_fn():
             if _vla_policy[0] is None:
                 print(f"[VLA] 정책 로딩 중... (device={_vla_device})")
-                _vla_policy[0], _vla_stats[0] = load_policy(_vla_checkpoint, _vla_device)
+                print(f"[VLA] 체크포인트 경로: {_vla_checkpoint[0]}")
+                _vla_policy[0], _vla_stats[0] = load_policy(_vla_checkpoint[0], _vla_device)
                 print("[VLA] 정책 로딩 완료.")
+            else:
+                print(f"[VLA] 이미 로드된 정책 재사용: {_vla_checkpoint[0]}")
             _vla_stop.clear()
             teleop_event.clear()
             time.sleep(0.3)  # 제어루프 마지막 servoJ 전송 완료 대기
@@ -750,14 +941,37 @@ def main():
                     return False
 
             # ── 1단계: 사전 티칭 동작 ───────────────────────────────────────
-            set_gripper(_GRIPPER_OPEN,      "1. gripper open")
+            if not move_home("1. home 경유"):                            return
+
+            # home 도착 직후: 노란색 ROI 내 blob 개수 검출 및 번호가 매겨진 스냅샷 저장
+            _wrist_cam_snap = cameras.get("wrist")
+            if _wrist_cam_snap is not None:
+                try:
+                    import cv2 as _cv2_snap
+                    import os as _os_snap
+                    _img_rgb_snap, _ = _wrist_cam_snap.read()
+                    _img_bgr_snap = _cv2_snap.cvtColor(_img_rgb_snap, _cv2_snap.COLOR_RGB2BGR)
+                    _yellow_blobs = _detect_color_blobs(_img_bgr_snap, [22, 150, 120], [32, 255, 255])
+                    print(f"[Hybrid] home 도착 직후 노란색 blob 검출: {len(_yellow_blobs)}개")
+                    for _i, _b in enumerate(_yellow_blobs, start=1):
+                        _cv2_snap.circle(_img_bgr_snap, (_b["cx"], _b["cy"]), 8, (0, 255, 255), -1)
+                        _cv2_snap.putText(_img_bgr_snap, f"yellow {_i}", (_b["cx"] + 10, _b["cy"]),
+                                           _cv2_snap.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                    _snap_dir = _os_snap.path.expanduser("~/vla_home_snapshots")
+                    _os_snap.makedirs(_snap_dir, exist_ok=True)
+                    _snap_path = _os_snap.path.join(_snap_dir, f"home_yellow_{int(time.time())}.png")
+                    _cv2_snap.imwrite(_snap_path, _img_bgr_snap)
+                    print(f"[Hybrid] 스냅샷 저장: {_snap_path}")
+                except Exception as _e:
+                    print(f"[Hybrid] 노란색 blob 스냅샷 실패: {_e}")
+            set_gripper(_GRIPPER_OPEN,      "2. gripper open")
             time.sleep(0.5)
-            if not move_cs(_PRE_GRASP_CS,  "2. 케이블 파지 전 자세"): return
-            if not move_cs(_GRASP_CS,       "3. 케이블 파지 자세"):   return
-            set_gripper(_GRIPPER_CLOSE,     "4. gripper close")
+            if not move_cs(_PRE_GRASP_CS,  "3. 케이블 파지 전 자세"): return
+            if not move_cs(_GRASP_CS,       "4. 케이블 파지 자세"):   return
+            set_gripper(_GRIPPER_CLOSE,     "5. gripper close")
             time.sleep(0.5)
-            if not move_cs(_POST_GRASP_CS,  "5. 케이블 파지 후 자세"): return
-            if not move_home():                                          return
+            if not move_cs(_POST_GRASP_CS,  "6. 케이블 파지 후 자세"): return
+            if not move_home("7. home"):                                 return
 
             # ── 2단계: VLA 추론 ─────────────────────────────────────────────
             print("[Hybrid] 사전 동작 완료. VLA 추론 시작.")
@@ -901,12 +1115,33 @@ def main():
 
     def go_home_fn():
         print("[GoHome] Moving to home position...")
+        teleop_event.clear()
+        time.sleep(0.3)  # 제어루프 마지막 servoJ 전송 완료 대기
+        # servoJ 스크립트를 완전히 종료하고 RTDE 스크립트 재시작
+        # (reuploadScript 없이 moveJ 호출 시 "another thread controlling" 에러 발생)
         try:
-            left_robot.robot.stopL(2.0)
+            left_robot.robot.servoStop(10.0)
         except Exception:
             pass
+        time.sleep(0.1)
+        try:
+            left_robot.robot.reuploadScript()
+        except Exception as e:
+            print(f"[GoHome] reuploadScript 실패: {e}")
+        # 스크립트가 로봇 컨트롤러에서 실제로 실행 중인지 확인 후 이동
+        # (확인 없이 바로 moveJ 호출 시 에러 없이 조용히 무시될 수 있음)
+        for _ in range(30):  # 최대 3초
+            try:
+                if left_robot.robot.isProgramRunning():
+                    break
+            except Exception:
+                pass
+            time.sleep(0.1)
+        time.sleep(0.2)  # 스크립트 초기화 완료 대기
+        print("[GoHome] RTDE 스크립트 재시작 완료")
         try:
             left_robot.robot.moveJ(_HOME_RAD, 0.5, 0.5)
+            print("[GoHome] Done.")
         except Exception as e:
             print(f"[GoHome] moveJ 실패: {e}")
 
@@ -926,6 +1161,13 @@ def main():
             pass
         print("[Admittance] OFF")
 
+    _current_checkpoint_label = None
+    if vla_cfg.get("checkpoint"):
+        _ckpt_path = Path(vla_cfg["checkpoint"]).expanduser()
+        # 기대 구조: <version>/checkpoints/<step>/pretrained_model
+        if _ckpt_path.name == "pretrained_model" and _ckpt_path.parent.parent.name == "checkpoints":
+            _current_checkpoint_label = f"{_ckpt_path.parent.parent.parent.name}/{_ckpt_path.parent.name}"
+
     panel = ControlPanel(
         teleop_event=teleop_event,
         gripper=gripper,
@@ -943,6 +1185,16 @@ def main():
         admittance_off_fn=admittance_off_fn,
         cameras=cameras,
         record_queue=_record_queue,
+        checkpoints_dir=checkpoints_root_dir,
+        datasets_dir=datasets_root_dir,
+        current_checkpoint=_current_checkpoint_label,
+        current_dataset=_current_dataset_name,
+        set_checkpoint_fn=set_checkpoint_fn,
+        set_dataset_fn=set_dataset_fn,
+        vla_params=vla_cfg,
+        set_vla_params_fn=set_vla_params_fn,
+        start_act_training_fn=start_act_training_fn,
+        start_align_training_fn=start_align_training_fn,
     )
     if recorder is not None:
         import atexit as _atexit

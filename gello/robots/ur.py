@@ -26,6 +26,18 @@ def _rotvec_to_rpy(rotvec: np.ndarray) -> np.ndarray:
     return np.array([roll, pitch, yaw], dtype=np.float32)
 
 
+def _unwrap_rotvec(rotvec_new: np.ndarray, rotvec_prev: np.ndarray) -> np.ndarray:
+    """회전각이 ±π 근처일 때 축각 표현이 부호를 뒤집는 불연속(±2π 점프)을 보정.
+    (axis, θ)와 (-axis, 2π-θ)는 동일한 회전이므로, 이전 프레임에 더 가까운 쪽을 선택한다."""
+    theta = np.linalg.norm(rotvec_new)
+    if theta < 1e-8:
+        return rotvec_new
+    rotvec_alt = rotvec_new - 2 * np.pi * (rotvec_new / theta)
+    if np.linalg.norm(rotvec_new - rotvec_prev) <= np.linalg.norm(rotvec_alt - rotvec_prev):
+        return rotvec_new
+    return rotvec_alt
+
+
 class URRobot(Robot):
     """A class representing a UR robot."""
 
@@ -34,6 +46,7 @@ class URRobot(Robot):
         robot_ip: str = "192.168.1.10",
         no_gripper: bool = False,
         gripper_port: Optional[str] = None,
+        unwrap_rotvec: bool = True,
     ):
         import rtde_control
         import rtde_receive
@@ -63,6 +76,10 @@ class URRobot(Robot):
         self.robot.endFreedriveMode()
         self._use_gripper = (not no_gripper) or (gripper_port is not None)
         self._prev_tcp_pos: Optional[np.ndarray] = None
+        self._prev_tcp_rotvec: Optional[np.ndarray] = None
+        # v19처럼 unwrap 적용 전(rotvec ±π 불연속이 낀 채로) 학습된 체크포인트를 쓸 때는
+        # False로 꺼서 학습 당시와 같은(불연속 있는) state 분포를 재현해야 한다.
+        self._unwrap_rotvec_enabled = unwrap_rotvec
 
     def num_dofs(self) -> int:
         """Get the number of joints of the robot.
@@ -147,6 +164,25 @@ class URRobot(Robot):
             self._free_drive = False
             self.robot.endFreedriveMode()
 
+    def state_orientation_key(self) -> str:
+        """state 조립 시 사용할 orientation 필드명.
+        unwrap_rotvec=True(v20용)면 'tcp_rotvec', False(v19용)면 'tcp_rpy'."""
+        return "tcp_rotvec" if self._unwrap_rotvec_enabled else "tcp_rpy"
+
+    def uses_rotvec_action_delta(self) -> bool:
+        """액션의 회전 델타 계산 방식.
+        True(v20)면 회전행렬 합성 기반 rotvec 델타, False(v19)면 RPY 성분별 차."""
+        return self._unwrap_rotvec_enabled
+
+    def reset_delta_tracking(self):
+        """Δxyz/rotvec 연속성 추적 상태 초기화.
+
+        VLA 추론처럼 새 제어 세션을 시작할 때 호출하지 않으면, 직전(하이브리드
+        사전 동작 등)의 큰 이동이 첫 tcp_xyz_delta에 그대로 섞여 들어가
+        모델이 비정상적으로 큰 액션을 예측하는 원인이 된다."""
+        self._prev_tcp_pos = None
+        self._prev_tcp_rotvec = None
+
     def get_observations(self, full: bool = True) -> Dict[str, np.ndarray]:
         joints = self.get_joint_state()
         joint_vels = np.array(self.r_inter.getActualQd())
@@ -154,7 +190,10 @@ class URRobot(Robot):
 
         tcp_pose = np.array(self.r_inter.getActualTCPPose())
         tcp_xyz = tcp_pose[:3]
-        tcp_rpy = _rotvec_to_rpy(tcp_pose[3:])
+        tcp_rotvec = tcp_pose[3:].astype(np.float32)  # 축각(axis-angle), 변환 없이 그대로 사용
+        if self._unwrap_rotvec_enabled and self._prev_tcp_rotvec is not None:
+            tcp_rotvec = _unwrap_rotvec(tcp_rotvec, self._prev_tcp_rotvec).astype(np.float32)
+        self._prev_tcp_rotvec = tcp_rotvec.copy()
         if self._prev_tcp_pos is None:
             tcp_xyz_delta = np.zeros(3, dtype=np.float32)
         else:
@@ -166,7 +205,10 @@ class URRobot(Robot):
             "joint_velocities": joint_vels,
             "gripper_position": gripper_pos,
             "tcp_xyz_delta":    tcp_xyz_delta,
-            "tcp_rpy":          tcp_rpy,
+            "tcp_rotvec":       tcp_rotvec,
+            # v19는 rotvec이 아니라 RPY로 state를 학습했으므로 항상 같이 제공한다
+            # (raw rotvec 기준 변환 — unwrap 여부와 무관하게 원본 그대로).
+            "tcp_rpy":          _rotvec_to_rpy(tcp_pose[3:]),
         }
         if full:
             obs["ee_pos_quat"] = tcp_pose

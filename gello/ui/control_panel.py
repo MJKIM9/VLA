@@ -1,19 +1,85 @@
 import queue as _queue_mod
 import threading
 import tkinter as tk
+from pathlib import Path
 from tkinter import ttk
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from gello.robots.datc_gripper import DATCGripper
 
-FONT_TITLE  = ("Helvetica", 18, "bold")
-FONT_BTN_LG = ("Helvetica", 16, "bold")
-FONT_BTN_MD = ("Helvetica", 14, "bold")
-FONT_BTN_SM = ("Helvetica", 13)
-FONT_LABEL  = ("Helvetica", 12)
-FONT_MONO   = ("Courier", 12)
+
+def _scan_checkpoints(checkpoints_dir: str) -> List[Tuple[str, str]]:
+    """checkpoints_dir/<version>/checkpoints/<step>/pretrained_model 구조를 스캔.
+    반환: [(표시용 라벨 "version/step", pretrained_model 경로), ...]"""
+    root = Path(checkpoints_dir).expanduser()
+    found = []
+    if not root.is_dir():
+        return found
+    for version_dir in sorted(root.iterdir()):
+        steps_dir = version_dir / "checkpoints"
+        if not steps_dir.is_dir():
+            continue
+        for step_dir in sorted(steps_dir.iterdir()):
+            pm = step_dir / "pretrained_model"
+            if pm.is_dir():
+                found.append((f"{version_dir.name}/{step_dir.name}", str(pm)))
+    return found
+
+
+def _scan_datasets(datasets_dir: str) -> List[str]:
+    """datasets_dir 아래 데이터셋 디렉터리 이름 목록 (백업 사본은 제외)."""
+    root = Path(datasets_dir).expanduser()
+    found = []
+    if not root.is_dir():
+        return found
+    for d in sorted(root.iterdir()):
+        if d.is_dir() and "_backup_" not in d.name:
+            found.append(d.name)
+    return found
+
+
+# (train_act.py 인자명, 캐스팅 함수, 기본값) — ACT 학습 파라미터
+_ACT_TRAIN_PARAMS = [
+    ("batch_size", int, 8),
+    ("num_workers", int, 4),
+    ("steps", int, 100000),
+    ("save_freq", int, 5000),
+    ("lr", float, 1e-4),
+    ("chunk_size", int, 50),
+]
+
+# (train_align.py 인자명, 캐스팅 함수, 기본값) — Align 학습 파라미터
+_ALIGN_TRAIN_PARAMS = [
+    ("epochs", int, 200),
+    ("batch_size", int, 256),
+    ("lr", float, 1e-3),
+    ("fine_threshold", float, 0.007),
+]
+
+# (yaml 키, 캐스팅 함수, 기본값) — VLA Parameters 패널에 노출할 수치형 파라미터
+_VLA_NUMERIC_PARAMS = [
+    ("speed_scale", float, 1.0),
+    ("delta_scale", float, 1.0),
+    ("chunk_size", int, 20),
+    ("z_insert", float, 0.24),
+]
+# (yaml 키, 기본값) — 체크박스로 노출할 불리언 파라미터
+_VLA_BOOL_PARAMS = [
+    ("control_gripper", True),
+    ("use_servoing", False),
+]
+
+# 맑은 고딕은 Windows 전용 폰트라 이 리눅스 환경엔 없어 동일 계열의 Noto Sans CJK KR로 대체
+FONT_FAMILY      = "Noto Sans CJK KR"
+FONT_MONO_FAMILY = "Noto Sans Mono CJK KR"
+FONT_TITLE  = (FONT_FAMILY, 18, "bold")
+FONT_BTN_LG = (FONT_FAMILY, 16, "bold")
+FONT_BTN_MD = (FONT_FAMILY, 14, "bold")
+FONT_BTN_SM = (FONT_FAMILY, 13, "bold")
+FONT_LABEL  = (FONT_FAMILY, 12, "bold")
+FONT_MONO   = (FONT_MONO_FAMILY, 12, "bold")
 PAD = {"padx": 14, "pady": 8}
 
 BG       = "#1e1e2e"
@@ -41,6 +107,16 @@ class ControlPanel:
         admittance_off_fn: Optional[Callable] = None,
         cameras: Optional[Dict] = None,
         record_queue=None,
+        checkpoints_dir: str = "~/checkpoints",
+        datasets_dir: str = "~/datasets",
+        current_checkpoint: Optional[str] = None,
+        current_dataset: Optional[str] = None,
+        set_checkpoint_fn: Optional[Callable[[str], None]] = None,
+        set_dataset_fn: Optional[Callable[[str], None]] = None,
+        vla_params: Optional[Dict] = None,
+        set_vla_params_fn: Optional[Callable[[Dict], None]] = None,
+        start_act_training_fn: Optional[Callable[[Dict], None]] = None,
+        start_align_training_fn: Optional[Callable[[Dict], None]] = None,
     ):
         self._teleop_event = teleop_event
         self._gripper = gripper
@@ -61,7 +137,20 @@ class ControlPanel:
         self._cameras = cameras or {}
         self._record_queue = record_queue
         self._impedance_on = False
+        self._saving = False  # 녹화 저장(record_queue 드레인) 도중 Go Home 등 로봇 명령 충돌 방지
         self._ui_queue = _queue_mod.Queue()  # 스레드→메인 UI 업데이트 큐
+
+        self._checkpoints_dir = checkpoints_dir
+        self._datasets_dir = datasets_dir
+        self._set_checkpoint_fn = set_checkpoint_fn
+        self._set_dataset_fn = set_dataset_fn
+        self._checkpoint_map: Dict[str, str] = {}  # 라벨 → pretrained_model 경로
+        self._current_checkpoint_label = current_checkpoint
+        self._current_dataset = current_dataset
+        self._vla_params = vla_params or {}
+        self._set_vla_params_fn = set_vla_params_fn
+        self._start_act_training_fn = start_act_training_fn
+        self._start_align_training_fn = start_align_training_fn
 
         self._root = tk.Tk()
         self._root.title("Robot Control Panel")
@@ -87,14 +176,14 @@ class ControlPanel:
         tk.Button(
             top_btn_row, text="■  STOP",
             bg="#e67e22", fg="white",
-            font=("Helvetica", 22, "bold"),
+            font=(FONT_FAMILY, 22, "bold"),
             relief="raised", bd=5, height=2,
             command=self._stop,
         ).pack(side="left", fill="both", expand=True, padx=(0, 6))
         tk.Button(
             top_btn_row, text="⛔  E-STOP",
             bg="#c0392b", fg="white",
-            font=("Helvetica", 22, "bold"),
+            font=(FONT_FAMILY, 22, "bold"),
             relief="raised", bd=5, height=2,
             command=self._estop,
         ).pack(side="left", fill="both", expand=True, padx=(6, 0))
@@ -146,6 +235,36 @@ class ControlPanel:
         self._rec_status = tk.Label(rec_frame, text="", font=FONT_LABEL, bg=BG_CARD, fg="#a6e3a1")
         self._rec_status.pack(pady=(0, 4))
 
+        # Model / Dataset selection
+        md_frame = ttk.LabelFrame(left, text="Model / Dataset", style="Card.TLabelframe")
+        md_frame.pack(fill="x", padx=4, pady=5)
+
+        ckpt_row = tk.Frame(md_frame, bg=BG_CARD)
+        ckpt_row.pack(fill="x", padx=8, pady=(6, 2))
+        tk.Label(ckpt_row, text="Checkpoint:", width=10, font=FONT_LABEL, bg=BG_CARD, fg=FG, anchor="w").pack(side="left")
+        self._ckpt_var = tk.StringVar()
+        self._ckpt_combo = ttk.Combobox(ckpt_row, textvariable=self._ckpt_var, state="readonly", width=22)
+        self._ckpt_combo.pack(side="left", padx=6)
+        self._ckpt_combo.bind("<<ComboboxSelected>>", self._on_checkpoint_selected)
+        tk.Button(ckpt_row, text="↻", width=3, font=FONT_BTN_SM, bg="#45475a", fg="white",
+                  relief="flat", command=self._refresh_checkpoints).pack(side="left")
+
+        ds_row = tk.Frame(md_frame, bg=BG_CARD)
+        ds_row.pack(fill="x", padx=8, pady=(2, 6))
+        tk.Label(ds_row, text="Dataset:", width=10, font=FONT_LABEL, bg=BG_CARD, fg=FG, anchor="w").pack(side="left")
+        self._ds_var = tk.StringVar()
+        self._ds_combo = ttk.Combobox(ds_row, textvariable=self._ds_var, state="readonly", width=22)
+        self._ds_combo.pack(side="left", padx=6)
+        self._ds_combo.bind("<<ComboboxSelected>>", self._on_dataset_selected)
+        tk.Button(ds_row, text="↻", width=3, font=FONT_BTN_SM, bg="#45475a", fg="white",
+                  relief="flat", command=self._refresh_datasets).pack(side="left")
+
+        self._md_status = tk.Label(md_frame, text="", font=FONT_LABEL, bg=BG_CARD, fg="#a6e3a1", justify="left")
+        self._md_status.pack(padx=8, pady=(0, 6), anchor="w")
+
+        self._refresh_checkpoints()
+        self._refresh_datasets()
+
         # VLA
         vla_frame = ttk.LabelFrame(left, text="VLA", style="Card.TLabelframe")
         vla_frame.pack(fill="x", padx=4, pady=5)
@@ -154,6 +273,37 @@ class ControlPanel:
             bg="#8e44ad", fg="white", font=FONT_BTN_MD,
             relief="flat", width=20, height=2, command=self._vla_demo,
         ).pack(padx=10, pady=8)
+
+        # VLA Parameters
+        self._vla_param_vars: Dict[str, tk.StringVar] = {}
+        self._vla_bool_vars: Dict[str, tk.BooleanVar] = {}
+        param_grid = tk.Frame(vla_frame, bg=BG_CARD)
+        param_grid.pack(fill="x", padx=8, pady=(0, 4))
+        for i, (key, cast, default) in enumerate(_VLA_NUMERIC_PARAMS):
+            r, c = divmod(i, 2)
+            cell = tk.Frame(param_grid, bg=BG_CARD)
+            cell.grid(row=r, column=c, sticky="w", padx=4, pady=2)
+            tk.Label(cell, text=f"{key}:", font=FONT_BTN_SM, bg=BG_CARD, fg=FG, width=20, anchor="w").pack(side="left")
+            var = tk.StringVar(value=str(self._vla_params.get(key, default)))
+            tk.Entry(cell, textvariable=var, width=8, font=FONT_BTN_SM).pack(side="left")
+            self._vla_param_vars[key] = var
+
+        bool_row = tk.Frame(vla_frame, bg=BG_CARD)
+        bool_row.pack(fill="x", padx=8, pady=(0, 4))
+        for key, default in _VLA_BOOL_PARAMS:
+            var = tk.BooleanVar(value=bool(self._vla_params.get(key, default)))
+            tk.Checkbutton(
+                bool_row, text=key, variable=var, font=FONT_BTN_SM,
+                bg=BG_CARD, fg=FG, selectcolor=BG_CARD, activebackground=BG_CARD,
+            ).pack(side="left", padx=4)
+            self._vla_bool_vars[key] = var
+
+        self._vla_param_status = tk.Label(vla_frame, text="", font=FONT_BTN_SM, bg=BG_CARD, fg="#a6e3a1")
+        self._vla_param_status.pack(padx=8, pady=(0, 2))
+        tk.Button(
+            vla_frame, text="Apply Parameters", bg="#45475a", fg="white", font=FONT_BTN_SM,
+            relief="flat", command=self._apply_vla_params,
+        ).pack(padx=10, pady=(0, 8))
 
         # Gravity Compensation
         gc_frame = ttk.LabelFrame(left, text="Gravity Compensation", style="Card.TLabelframe")
@@ -198,6 +348,65 @@ class ControlPanel:
             font=FONT_BTN_SM, relief="flat", command=self._toggle_impedance,
         )
         self._imp_btn.pack(side="left", padx=6)
+
+        # Training (수집된 데이터셋 기준 오프라인 학습 — 별도 프로세스로 실행)
+        train_frame = ttk.LabelFrame(left, text="Training (offline)", style="Card.TLabelframe")
+        train_frame.pack(fill="x", padx=4, pady=5)
+        tk.Label(
+            train_frame, text="학습 대상 데이터셋 = 위 Model / Dataset에서 선택된 데이터셋",
+            font=FONT_BTN_SM, bg=BG_CARD, fg=FG_DIM, wraplength=280, justify="left",
+        ).pack(padx=8, pady=(6, 2), anchor="w")
+
+        # ACT
+        act_sub = tk.LabelFrame(train_frame, text="ACT", bg=BG_CARD, fg=FG, font=FONT_BTN_SM)
+        act_sub.pack(fill="x", padx=8, pady=4)
+        self._act_train_vars: Dict[str, tk.StringVar] = {}
+        act_grid = tk.Frame(act_sub, bg=BG_CARD)
+        act_grid.pack(fill="x", padx=4, pady=2)
+        for i, (key, cast, default) in enumerate(_ACT_TRAIN_PARAMS):
+            r, c = divmod(i, 2)
+            cell = tk.Frame(act_grid, bg=BG_CARD)
+            cell.grid(row=r, column=c, sticky="w", padx=4, pady=2)
+            tk.Label(cell, text=f"{key}:", font=FONT_BTN_SM, bg=BG_CARD, fg=FG, width=12, anchor="w").pack(side="left")
+            var = tk.StringVar(value=str(default))
+            tk.Entry(cell, textvariable=var, width=8, font=FONT_BTN_SM).pack(side="left")
+            self._act_train_vars[key] = var
+        act_name_row = tk.Frame(act_sub, bg=BG_CARD)
+        act_name_row.pack(fill="x", padx=4, pady=2)
+        tk.Label(act_name_row, text="output_name:", font=FONT_BTN_SM, bg=BG_CARD, fg=FG, width=12, anchor="w").pack(side="left")
+        self._act_output_var = tk.StringVar(value="ur10_act_new")
+        tk.Entry(act_name_row, textvariable=self._act_output_var, width=18, font=FONT_BTN_SM).pack(side="left")
+        tk.Button(
+            act_sub, text="▶  Start ACT Training", bg="#8e44ad", fg="white", font=FONT_BTN_SM,
+            relief="flat", command=self._start_act_training,
+        ).pack(padx=4, pady=(2, 6))
+
+        # Align
+        align_sub = tk.LabelFrame(train_frame, text="Align", bg=BG_CARD, fg=FG, font=FONT_BTN_SM)
+        align_sub.pack(fill="x", padx=8, pady=(0, 4))
+        self._align_train_vars: Dict[str, tk.StringVar] = {}
+        align_grid = tk.Frame(align_sub, bg=BG_CARD)
+        align_grid.pack(fill="x", padx=4, pady=2)
+        for i, (key, cast, default) in enumerate(_ALIGN_TRAIN_PARAMS):
+            r, c = divmod(i, 2)
+            cell = tk.Frame(align_grid, bg=BG_CARD)
+            cell.grid(row=r, column=c, sticky="w", padx=4, pady=2)
+            tk.Label(cell, text=f"{key}:", font=FONT_BTN_SM, bg=BG_CARD, fg=FG, width=12, anchor="w").pack(side="left")
+            var = tk.StringVar(value=str(default))
+            tk.Entry(cell, textvariable=var, width=8, font=FONT_BTN_SM).pack(side="left")
+            self._align_train_vars[key] = var
+        align_name_row = tk.Frame(align_sub, bg=BG_CARD)
+        align_name_row.pack(fill="x", padx=4, pady=2)
+        tk.Label(align_name_row, text="output_name:", font=FONT_BTN_SM, bg=BG_CARD, fg=FG, width=12, anchor="w").pack(side="left")
+        self._align_output_var = tk.StringVar(value="align_xy_mlp.pt")
+        tk.Entry(align_name_row, textvariable=self._align_output_var, width=18, font=FONT_BTN_SM).pack(side="left")
+        tk.Button(
+            align_sub, text="▶  Start Align Training", bg="#8e44ad", fg="white", font=FONT_BTN_SM,
+            relief="flat", command=self._start_align_training,
+        ).pack(padx=4, pady=(2, 6))
+
+        self._train_status = tk.Label(train_frame, text="", font=FONT_BTN_SM, bg=BG_CARD, fg="#a6e3a1", wraplength=280, justify="left")
+        self._train_status.pack(padx=8, pady=(0, 6), anchor="w")
 
         # ── 오른쪽: 관절각 + 카메라 ──────────────────────────────────
 
@@ -314,7 +523,7 @@ class ControlPanel:
                 for name in self._cam_labels:
                     if name == "wrist":
                         if wrist_rgb is not None:
-                            pil_images[name] = Image.fromarray(wrist_rgb).resize((320, 240))
+                            pil_images[name] = Image.fromarray(wrist_rgb).resize((480, 360))
 
                     elif name in ("exterior", "detect"):
                         # exterior 슬롯: wrist 카메라 검출 오버레이 (preview_color_detect.py 방식)
@@ -377,13 +586,13 @@ class ControlPanel:
                                                  _cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 1)
 
                         vis_rgb = _cv2.cvtColor(vis, _cv2.COLOR_BGR2RGB)
-                        pil_images[name] = Image.fromarray(vis_rgb).resize((320, 240))
+                        pil_images[name] = Image.fromarray(vis_rgb).resize((480, 360))
 
                     else:
                         cam = self._cameras.get(name)
                         if cam is not None:
                             img, _ = cam.read()
-                            pil_images[name] = Image.fromarray(img).resize((320, 240))
+                            pil_images[name] = Image.fromarray(img).resize((480, 360))
 
             except Exception as _e:
                 import traceback as _tb
@@ -454,6 +663,9 @@ class ControlPanel:
     def _go_home(self):
         if self._go_home_fn is None:
             return
+        if getattr(self, "_saving", False):
+            print("[GoHome] 녹화 저장 중에는 Go Home을 실행할 수 없습니다 (저장 완료 후 다시 눌러주세요).")
+            return
         self._teleop_event.clear()
         self._teleop_btn.config(text="○  Teleop OFF", bg="#e74c3c")
         threading.Thread(target=self._go_home_fn, daemon=True).start()
@@ -468,21 +680,28 @@ class ControlPanel:
         else:
             self._rec_btn.config(text="Saving...", bg="#95a5a6", state="disabled")
             self._rec_status.config(text="저장 중...")
+            self._saving = True
             def _save():
                 status_text = "Save error: unknown"
+                status_color = "#f38ba8"
                 try:
-                    self._recorder.end_episode(save=True, record_queue=self._record_queue)
+                    ok = self._recorder.end_episode(save=True, record_queue=self._record_queue)
                     count = self._recorder._episode_count
-                    status_text = f"Saved. Total: {count} episodes"
+                    if ok:
+                        status_text = f"Saved. Total: {count} episodes"
+                        status_color = "#a6e3a1"
+                    else:
+                        status_text = f"저장 실패 — 터미널 로그 확인 (Total: {count} episodes)"
                 except Exception as e:
                     import traceback; traceback.print_exc()
                     status_text = f"Save error: {e}"
                 print(f"[UI] Scheduling button re-enable, status: {status_text}")
-                _st = status_text
-                def _update_ui(st=_st):
+                self._saving = False
+                _st, _color = status_text, status_color
+                def _update_ui(st=_st, color=_color):
                     print("[UI] _update_ui called")
                     self._rec_btn.config(text="● Record", bg="#2ecc71", state="normal")
-                    self._rec_status.config(text=st)
+                    self._rec_status.config(text=st, fg=color)
                 self._schedule_ui(_update_ui)
             threading.Thread(target=_save, daemon=True).start()
 
@@ -528,6 +747,112 @@ class ControlPanel:
                     text=label, bg=color, state="normal"))
 
         threading.Thread(target=_do_gc, daemon=True).start()
+
+    def _refresh_checkpoints(self):
+        entries = _scan_checkpoints(self._checkpoints_dir)
+        self._checkpoint_map = {label: path for label, path in entries}
+        self._ckpt_combo["values"] = list(self._checkpoint_map.keys())
+        if self._current_checkpoint_label and self._current_checkpoint_label in self._checkpoint_map:
+            self._ckpt_var.set(self._current_checkpoint_label)
+        self._update_md_status()
+
+    def _refresh_datasets(self):
+        names = _scan_datasets(self._datasets_dir)
+        self._ds_combo["values"] = names
+        if self._current_dataset and self._current_dataset in names:
+            self._ds_var.set(self._current_dataset)
+        self._update_md_status()
+
+    def _update_md_status(self):
+        ckpt = self._current_checkpoint_label or "(미선택)"
+        ds = self._current_dataset or "(미선택)"
+        self._md_status.config(text=f"Active checkpoint: {ckpt}\nActive dataset: {ds}")
+
+    def _on_checkpoint_selected(self, event=None):
+        label = self._ckpt_var.get()
+        path = self._checkpoint_map.get(label)
+        if path is None or self._set_checkpoint_fn is None:
+            return
+        try:
+            self._set_checkpoint_fn(path)
+            self._current_checkpoint_label = label
+        except Exception as e:
+            print(f"[Model] 체크포인트 변경 오류: {e}")
+        self._update_md_status()
+
+    def _on_dataset_selected(self, event=None):
+        name = self._ds_var.get()
+        if not name or self._set_dataset_fn is None:
+            return
+        try:
+            self._set_dataset_fn(name)
+            self._current_dataset = name
+        except Exception as e:
+            print(f"[Dataset] 변경 오류: {e}")
+        self._update_md_status()
+
+    def _apply_vla_params(self):
+        new_values = {}
+        for key, cast, _default in _VLA_NUMERIC_PARAMS:
+            raw = self._vla_param_vars[key].get()
+            try:
+                new_values[key] = cast(raw)
+            except ValueError:
+                self._vla_param_status.config(text=f"잘못된 값: {key}={raw}", fg="#f38ba8")
+                return
+        for key, _default in _VLA_BOOL_PARAMS:
+            new_values[key] = self._vla_bool_vars[key].get()
+        if self._set_vla_params_fn is not None:
+            try:
+                self._set_vla_params_fn(new_values)
+                self._vla_params.update(new_values)
+                self._vla_param_status.config(text="적용됨 (다음 VLA Demo부터 반영)", fg="#a6e3a1")
+            except Exception as e:
+                self._vla_param_status.config(text=f"적용 오류: {e}", fg="#f38ba8")
+
+    def _start_act_training(self):
+        if self._start_act_training_fn is None:
+            return
+        if not self._current_dataset:
+            self._train_status.config(text="학습할 데이터셋을 먼저 선택하세요.", fg="#f38ba8")
+            return
+        params = {"dataset_name": self._current_dataset, "output_name": self._act_output_var.get().strip()}
+        for key, cast, _default in _ACT_TRAIN_PARAMS:
+            raw = self._act_train_vars[key].get()
+            try:
+                params[key] = cast(raw)
+            except ValueError:
+                self._train_status.config(text=f"잘못된 값: {key}={raw}", fg="#f38ba8")
+                return
+        try:
+            self._start_act_training_fn(params)
+            self._train_status.config(text=f"ACT 학습 시작: {params['output_name']}", fg="#a6e3a1")
+        except Exception as e:
+            self._train_status.config(text=f"ACT 학습 시작 오류: {e}", fg="#f38ba8")
+
+    def _start_align_training(self):
+        if self._start_align_training_fn is None:
+            return
+        if not self._current_dataset:
+            self._train_status.config(text="학습할 데이터셋을 먼저 선택하세요.", fg="#f38ba8")
+            return
+        params = {"dataset_name": self._current_dataset, "output_name": self._align_output_var.get().strip()}
+        for key, cast, _default in _ALIGN_TRAIN_PARAMS:
+            raw = self._align_train_vars[key].get()
+            try:
+                params[key] = cast(raw)
+            except ValueError:
+                self._train_status.config(text=f"잘못된 값: {key}={raw}", fg="#f38ba8")
+                return
+        try:
+            self._start_align_training_fn(params)
+            self._train_status.config(text=f"Align 학습 시작: {params['output_name']}", fg="#a6e3a1")
+        except Exception as e:
+            self._train_status.config(text=f"Align 학습 시작 오류: {e}", fg="#f38ba8")
+
+    def set_recorder(self, recorder):
+        """데이터셋 전환 시 새 recorder 인스턴스로 교체."""
+        self._recorder = recorder
 
     def _vla_demo(self):
         if self._vla_demo_fn:

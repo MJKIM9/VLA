@@ -79,7 +79,7 @@ class RobotEnv:
         observations["wrench"] = robot_obs.get("wrench", np.zeros(6))
         observations["gripper_position"] = robot_obs.get("gripper_position", np.zeros(1))
         observations["tcp_xyz_delta"] = robot_obs.get("tcp_xyz_delta", np.zeros(3))
-        observations["tcp_rpy"] = robot_obs.get("tcp_rpy", np.zeros(3))
+        observations["tcp_rotvec"] = robot_obs.get("tcp_rotvec", np.zeros(3))
         return observations
 
 

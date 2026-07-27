@@ -91,7 +91,10 @@ _COLOR_ROI_RIGHT  = 0.85
 
 # Visual servoing 파라미터
 _SERVOING_THRESHOLD = 0.007  # ACT xy_mag 이 값 미만이면 servoing 모드 진입
-_SERVOING_K        = 0.2     # 비례 게인 (실험으로 튜닝)
+_SERVOING_K        = 0.05    # 비례 게인 (실험으로 튜닝) — 낮출수록 정렬 오차에 덜 민감하게(부드럽게) 반응
+
+# ACT 예측 z 델타에 곱하는 게인 — z_freeze 진입 전(순수 ACT 구간)의 z 민감도 조절
+_Z_GAIN = 1.5
 
 # TCP orientation 고정 (roll/pitch)
 _TARGET_ROLL_RAD  = np.deg2rad(-179.99)
@@ -245,8 +248,11 @@ def compute_alignment_xyz(img_bgr, wrist_cam) -> np.ndarray:
 
 def obs_to_tensor(obs: dict, camera_keys: list, device: str,
                   img_height: int, img_width: int, stats: dict,
-                  wrist_cam=None, fix_orientation: bool = True):
-    """Convert robot obs dict to ACTPolicy batch dict with normalization."""
+                  wrist_cam=None, fix_orientation: bool = True,
+                  orientation_key: str = "tcp_rotvec"):
+    """Convert robot obs dict to ACTPolicy batch dict with normalization.
+
+    orientation_key: 'tcp_rotvec'(v20, unwrap 적용) 또는 'tcp_rpy'(v19, unwrap 이전 학습)."""
     import torch
     import cv2
 
@@ -257,16 +263,26 @@ def obs_to_tensor(obs: dict, camera_keys: list, device: str,
         wrist_bgr = cv2.cvtColor(wrist_img, cv2.COLOR_RGB2BGR)
         align_xyz = compute_alignment_xyz(wrist_bgr, wrist_cam)
 
-    rpy = obs["tcp_rpy"].copy()
-    if fix_orientation:
-        rpy[0] = np.deg2rad(-179.99)
-        rpy[1] = np.deg2rad(0.0)
+    if orientation_key == "tcp_rpy":
+        orientation = obs["tcp_rpy"].copy()
+        if fix_orientation:
+            orientation[0] = np.deg2rad(-179.99)
+            orientation[1] = np.deg2rad(0.0)
+    else:
+        orientation = obs["tcp_rotvec"].copy()
+        if fix_orientation:
+            # roll/pitch 고정, yaw는 실제값 유지 — RPY로 임시 변환해 고정 후 축각으로 복원
+            from gello.robots.ur import _rotvec_to_rpy
+            rpy = _rotvec_to_rpy(orientation)
+            rpy[0] = np.deg2rad(-179.99)
+            rpy[1] = np.deg2rad(0.0)
+            orientation = _rpy_to_rotvec(rpy)
     state = np.concatenate([
         obs["tcp_xyz_delta"],      # 3
-        rpy,                       # 3 (roll/pitch 고정, yaw는 실제값)
+        orientation,                # 3 (orientation_key에 따라 축각 또는 RPY)
         obs["gripper_position"],   # 1
         align_xyz[:2],             # 2 (align_x, align_y)
-    ])  # 총 9차원 (v17)
+    ])  # 총 9차원
     state_t = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
 
     # Normalize observation.state: z = (x - mean) / (std + eps)
@@ -367,13 +383,25 @@ def run_inference(
     """
     dt = speed_scale / fps
     camera_keys = [f"observation.images.{k}" for k in cameras]
+    _orientation_key = direct_robot.state_orientation_key() if direct_robot is not None else "tcp_rotvec"
+    print(f"[VLA] state orientation 표현: {_orientation_key}")
 
     effective_hz = fps / speed_scale
     mode = "직접(ZMQ 우회)" if direct_robot is not None else "ZMQ"
     print(f"[VLA] Starting inference at {fps}Hz × 1/{speed_scale:.1f} = {effective_hz:.1f}Hz effective, chunk_size={chunk_size}, mode={mode}")
     policy.reset()
 
+    # 직전(하이브리드 사전 동작 등)의 큰 이동이 첫 tcp_xyz_delta에 섞여 들어가지 않도록
+    # Δxyz/rotvec 추적 상태를 리셋한 뒤 obs를 다시 읽는다.
+    if direct_robot is not None:
+        direct_robot.reset_delta_tracking()
     obs = direct_robot.get_observations() if direct_robot is not None else env.get_obs()
+    print(f"[VLA][reset] Δxyz/rotvec 리셋 직후 tcp_xyz_delta={obs['tcp_xyz_delta'].tolist()}")
+
+    # 안전장치: 학습 데이터 통계와 무관한 절대 선속도 상한 (m/s).
+    # speed_scale/delta_scale이 적용된 뒤 실제로 servoL에 들어가는 물리적 이동거리 기준.
+    _MAX_LINEAR_SPEED = 0.1  # m/s
+    _max_raw_xyz_norm = (_MAX_LINEAR_SPEED * dt) / max(speed_scale * delta_scale, 1e-9)
 
     # 어드미턴스 스프링 기준점: VLA 추론 시작 시점의 TCP 위치로 복귀
     _adm_origin_xyz = None
@@ -401,6 +429,15 @@ def run_inference(
     if _wrist_cam is not None and "wrist" in cam_buffers:
         _align_buf = _AlignBuffer(cam_buffers["wrist"], _wrist_cam)
 
+    # 서보잉 목표: 두 점을 정확히 일치(align_y=0)시키는 게 아니라,
+    # 노란점이 파란(케이블)점보다 이미지 높이의 약 3%만큼 위에 오도록 정렬한다.
+    # align_y는 "양수 = cable이 yellow보다 아래(yellow가 위)"이므로 목표값은 양수.
+    _SERVOING_TARGET_Y_PCT = 0.03  # 이미지 높이 대비 목표 오프셋 비율
+    if _wrist_cam is not None:
+        _servoing_target_y = _SERVOING_TARGET_Y_PCT * img_height * _ALIGN_FIXED_DEPTH / _wrist_cam.fy
+    else:
+        _servoing_target_y = 0.0
+
     # 비동기 추론: chunk 경계에서 다음 chunk를 백그라운드로 미리 계산
     import concurrent.futures
     _executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -427,10 +464,19 @@ def run_inference(
         if img is not None:
             obs[f"observation.images.{key}"] = img
     _batch0 = obs_to_tensor(obs, camera_keys, device, img_height, img_width, stats,
-                            wrist_cam=cameras.get("wrist"), fix_orientation=fix_orientation)
+                            wrist_cam=cameras.get("wrist"), fix_orientation=fix_orientation,
+                            orientation_key=_orientation_key)
     policy.reset()
     _cached_actions = _infer_chunk(_batch0)
     _step_in_chunk = 0
+
+    # 디버그용 손목 카메라 영상 저장 (VLA Demo 실행 중 전체를 mp4로)
+    import os as _os_dbg
+    _debug_dir = _os_dbg.path.expanduser(f"~/vla_debug_frames/{int(time.time())}")
+    _os_dbg.makedirs(_debug_dir, exist_ok=True)
+    _debug_video_path = f"{_debug_dir}/wrist.mp4"
+    print(f"[VLA] 손목 카메라 디버그 영상 저장 경로: {_debug_video_path}")
+    _debug_video_writer = None
 
     while not stop_event.is_set():
         t0 = time.time()
@@ -441,15 +487,61 @@ def run_inference(
             if img is not None:
                 obs[f"observation.images.{key}"] = img
 
+        wrist_img_now = obs.get("observation.images.wrist")
+        if wrist_img_now is not None:
+            import cv2 as _cv2_dbg
+            _bgr_dbg = _cv2_dbg.cvtColor(wrist_img_now, _cv2_dbg.COLOR_RGB2BGR)
+
+            # 케이블(검정) ROI 시각화
+            _h_dbg0, _w_dbg0 = _bgr_dbg.shape[:2]
+            _cv2_dbg.rectangle(
+                _bgr_dbg,
+                (int(_w_dbg0 * _CABLE_ROI_LEFT), int(_h_dbg0 * _CABLE_ROI_TOP)),
+                (int(_w_dbg0 * _CABLE_ROI_RIGHT), int(_h_dbg0 * _CABLE_ROI_BOTTOM)),
+                (255, 255, 0), 1,
+            )
+
+            # 노란 물체 / 케이블 tip 검출 결과 오버레이
+            _yellow_px = _detect_color_centroid(_bgr_dbg, [22, 150, 120], [32, 255, 255])
+            _cable_px = _detect_cable_tip(_bgr_dbg)
+            if _yellow_px is not None:
+                _cv2_dbg.circle(_bgr_dbg, _yellow_px, 6, (0, 255, 255), -1)
+                _cv2_dbg.putText(_bgr_dbg, "yellow", (_yellow_px[0] + 8, _yellow_px[1]),
+                                  _cv2_dbg.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+            if _cable_px is not None:
+                _cv2_dbg.circle(_bgr_dbg, _cable_px, 6, (255, 0, 0), -1)
+                _cv2_dbg.putText(_bgr_dbg, "cable", (_cable_px[0] + 8, _cable_px[1]),
+                                  _cv2_dbg.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 1)
+            if _yellow_px is not None and _cable_px is not None:
+                _cv2_dbg.line(_bgr_dbg, _yellow_px, _cable_px, (0, 255, 0), 1)
+
+            # 현재 정렬(align_x, align_y) 값 텍스트 표시
+            if _align_buf is not None:
+                _align_xy_dbg = _align_buf.get()
+                _cv2_dbg.putText(
+                    _bgr_dbg,
+                    f"align x={_align_xy_dbg[0]*1000:.1f}mm y={_align_xy_dbg[1]*1000:.1f}mm",
+                    (10, _h_dbg0 - 10), _cv2_dbg.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1,
+                )
+
+            if _debug_video_writer is None:
+                _h_dbg, _w_dbg = _bgr_dbg.shape[:2]
+                _fourcc_dbg = _cv2_dbg.VideoWriter_fourcc(*"mp4v")
+                _debug_video_writer = _cv2_dbg.VideoWriter(
+                    _debug_video_path, _fourcc_dbg, effective_hz, (_w_dbg, _h_dbg))
+            _debug_video_writer.write(_bgr_dbg)
+
         # chunk 첫 step에 다음 chunk 비동기 추론 시작 (15 step × 33ms = 500ms 여유)
         if _step_in_chunk == 0 and _next_future is None:
             batch_snap = obs_to_tensor(obs, camera_keys, device, img_height, img_width, stats,
-                                       wrist_cam=cameras.get("wrist"), fix_orientation=fix_orientation)
+                                       wrist_cam=cameras.get("wrist"), fix_orientation=fix_orientation,
+                            orientation_key=_orientation_key)
             _next_future = _executor.submit(_infer_chunk, batch_snap)
 
         # 현재 chunk에서 액션 꺼내기
         delta_np = _cached_actions[_step_in_chunk].copy()
         _step_in_chunk += 1
+        delta_np[2] = delta_np[2] * _Z_GAIN  # z_freeze 진입 전 ACT z 민감도 조절 (진입 후엔 0으로 덮어써짐)
 
         # align_xy: 백그라운드 스레드에서 계산된 최신 값 읽기
         _align_xy = _align_buf.get() if _align_buf is not None else np.zeros(2, dtype=np.float32)
@@ -459,13 +551,24 @@ def run_inference(
 
         # Visual servoing: ACT와 동일하게 시작/종료, xy delta를 align 비례제어로 대체
         if use_servoing and np.linalg.norm(_align_xy) > 1e-4:
+            _y_err = _align_xy[1] - _servoing_target_y
             delta_np[0] = _SERVOING_K * _align_xy[0]
-            delta_np[1] = _SERVOING_K * _align_xy[1]
+            delta_np[1] = -_SERVOING_K * _y_err  # y축 부호 반전 + 목표 오프셋(노란점이 목표% 위)
+            print(f"[VLA][servoing] align_y={_align_xy[1]:.4f} target={_servoing_target_y:.4f} "
+                  f"err={_y_err:.4f} dy={delta_np[1]:.5f}")
 
         # z 제어 및 삽입 조건 체크
         if direct_robot is not None:
             try:
                 tcp_z = direct_robot.r_inter.getActualTCPPose()[2]
+                # z_approach 도달 전, ACT의 z 예측이 정체/수렴해 중간에 멈추는 것을 방지하기 위한
+                # 최소 하강 속도 보장. 모델이 이미 이보다 빠르게 내려가고 있으면 그대로 두고,
+                # 느리거나 멈추거나 올라가려 하면 강제로 이 속도로 내려가게 한다.
+                _MIN_DESCENT_RATE = -0.0002  # m/step
+                if (z_approach_threshold is not None and not _z_freeze_mode
+                        and tcp_z > z_approach_threshold
+                        and delta_np[2] > _MIN_DESCENT_RATE):
+                    delta_np[2] = _MIN_DESCENT_RATE
                 if use_z_freeze:
                     if z_approach_threshold is not None and not _z_freeze_mode and tcp_z <= z_approach_threshold:
                         _z_freeze_mode = True
@@ -474,8 +577,11 @@ def run_inference(
                         delta_np[2] = 0.0
                         if use_z_freeze == "servoing":
                             # ACT 출력 무시, 서보잉으로 xy 제어
+                            _y_err = _align_xy[1] - _servoing_target_y
                             delta_np[0] = _SERVOING_K * _align_xy[0]
-                            delta_np[1] = _SERVOING_K * _align_xy[1]
+                            delta_np[1] = -_SERVOING_K * _y_err  # y축 부호 반전 + 목표 오프셋(노란점이 목표% 위)
+                            print(f"[VLA][servoing] align_y={_align_xy[1]:.4f} target={_servoing_target_y:.4f} "
+                                  f"err={_y_err:.4f} dy={delta_np[1]:.5f}")
                 else:
                     # z_floor 모드: z_floor 이하 하강 차단
                     if z_floor is not None and tcp_z <= z_floor:
@@ -490,6 +596,15 @@ def run_inference(
                         stop_event.set()
             except Exception:
                 pass
+
+        # 절대 속도 상한: 서보잉/z-freeze로 xy가 덮어써진 뒤의 최종 delta_np에 적용해야
+        # 서보잉 출력도 빠짐없이 안전 범위 안으로 제한된다.
+        _xyz_norm = float(np.linalg.norm(delta_np[:3]))
+        if _xyz_norm > _max_raw_xyz_norm:
+            _scale = _max_raw_xyz_norm / (_xyz_norm + 1e-12)
+            print(f"[VLA][safety] 절대 속도 상한({_MAX_LINEAR_SPEED} m/s) 초과, 축소 적용: "
+                  f"{np.round(delta_np[:3], 5).tolist()} -> {np.round(delta_np[:3] * _scale, 5).tolist()}")
+            delta_np[:3] = delta_np[:3] * _scale
 
         # chunk 소진 시 다음 chunk로 교체
         if _step_in_chunk >= chunk_size:
@@ -508,16 +623,23 @@ def run_inference(
         q_current = np.array(obs["joint_positions"])
 
         if cartesian_action and direct_robot is not None:
-            # v19: delta_np = [dx, dy, dz, d_roll, d_pitch, d_yaw, d_gripper]
+            # delta_np = [dx, dy, dz, d_rx, d_ry, d_rz(축각 델타), d_gripper]
             try:
                 _cur_tcp = list(direct_robot.r_inter.getActualTCPPose())  # [x,y,z,rx,ry,rz]
                 # xyz: 직접 delta 적용
                 new_xyz = [_cur_tcp[i] + delta_np[i] * speed_scale * delta_scale for i in range(3)]
-                # orientation: rotvec → RPY → delta 적용 → rotvec
-                from gello.robots.ur import _rotvec_to_rpy as _r2rpy
-                cur_rpy = _r2rpy(np.array(_cur_tcp[3:6])).astype(np.float64)
-                new_rpy = cur_rpy + np.array(delta_np[3:6], dtype=np.float64) * speed_scale * delta_scale
-                new_rv = _rpy_to_rotvec(new_rpy)
+                # orientation: 회전 델타 적용 방식은 기록 시와 대칭
+                # (v20: 회전행렬 합성 기반 rotvec 델타 / v19: RPY 성분별 차)
+                if direct_robot.uses_rotvec_action_delta():
+                    from scipy.spatial.transform import Rotation as _RotApply
+                    R_cur = _RotApply.from_rotvec(np.array(_cur_tcp[3:6], dtype=np.float64))
+                    R_delta = _RotApply.from_rotvec(np.array(delta_np[3:6], dtype=np.float64) * speed_scale * delta_scale)
+                    new_rv = (R_delta * R_cur).as_rotvec()
+                else:
+                    from gello.robots.ur import _rotvec_to_rpy
+                    cur_rpy = _rotvec_to_rpy(np.array(_cur_tcp[3:6], dtype=np.float64)).astype(np.float64)
+                    new_rpy = cur_rpy + np.array(delta_np[3:6], dtype=np.float64) * speed_scale * delta_scale
+                    new_rv = _rpy_to_rotvec(new_rpy)
                 # 소프트웨어 어드미턴스: F/T 센서 기반 위치 보정
                 if admittance_gain > 0.0:
                     try:
@@ -592,6 +714,9 @@ def run_inference(
     _executor.shutdown(wait=False)
     if _align_buf is not None:
         _align_buf.stop()
+    if _debug_video_writer is not None:
+        _debug_video_writer.release()
+        print(f"[VLA] 손목 카메라 디버그 영상 저장 완료: {_debug_video_path}")
     print("[VLA] Inference stopped.")
     return _insertion_ready
 
