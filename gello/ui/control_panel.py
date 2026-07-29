@@ -65,10 +65,14 @@ _VLA_NUMERIC_PARAMS = [
     ("chunk_size", int, 20),
     ("z_insert", float, 0.24),
 ]
-# (yaml 키, 기본값) — 체크박스로 노출할 불리언 파라미터
+# (yaml 키, 기본값, 표시 라벨) — 체크박스로 노출할 불리언 파라미터
 _VLA_BOOL_PARAMS = [
-    ("control_gripper", True),
-    ("use_servoing", False),
+    ("control_gripper", True, "control_gripper"),
+    ("finger_change", True, "Finger Change"),
+]
+# (yaml 키, 선택지, 기본값) — 드롭다운으로 노출할 문자열/다중값 파라미터
+_VLA_CHOICE_PARAMS = [
+    ("use_z_freeze", ["false", "act", "servoing"], "false"),
 ]
 
 # 맑은 고딕은 Windows 전용 폰트라 이 리눅스 환경엔 없어 동일 계열의 Noto Sans CJK KR로 대체
@@ -94,6 +98,7 @@ class ControlPanel:
         teleop_event: threading.Event,
         gripper: Optional[DATCGripper] = None,
         recorder=None,
+        recorder_lock: Optional[threading.Lock] = None,
         vla_demo_fn: Optional[Callable] = None,
         gello_robot=None,
         gc_xml_path: Optional[str] = None,
@@ -113,6 +118,8 @@ class ControlPanel:
         current_dataset: Optional[str] = None,
         set_checkpoint_fn: Optional[Callable[[str], None]] = None,
         set_dataset_fn: Optional[Callable[[str], None]] = None,
+        set_unwrap_rotvec_fn: Optional[Callable[[bool], None]] = None,
+        current_unwrap_rotvec: bool = False,
         vla_params: Optional[Dict] = None,
         set_vla_params_fn: Optional[Callable[[Dict], None]] = None,
         start_act_training_fn: Optional[Callable[[Dict], None]] = None,
@@ -121,6 +128,7 @@ class ControlPanel:
         self._teleop_event = teleop_event
         self._gripper = gripper
         self._recorder = recorder
+        self._recorder_lock = recorder_lock
         self._vla_demo_fn = vla_demo_fn
         self._gello_robot = gello_robot
         self._gc_xml_path = gc_xml_path
@@ -144,9 +152,11 @@ class ControlPanel:
         self._datasets_dir = datasets_dir
         self._set_checkpoint_fn = set_checkpoint_fn
         self._set_dataset_fn = set_dataset_fn
+        self._set_unwrap_rotvec_fn = set_unwrap_rotvec_fn
         self._checkpoint_map: Dict[str, str] = {}  # 라벨 → pretrained_model 경로
         self._current_checkpoint_label = current_checkpoint
         self._current_dataset = current_dataset
+        self._current_unwrap_rotvec = current_unwrap_rotvec
         self._vla_params = vla_params or {}
         self._set_vla_params_fn = set_vla_params_fn
         self._start_act_training_fn = start_act_training_fn
@@ -262,6 +272,16 @@ class ControlPanel:
         self._md_status = tk.Label(md_frame, text="", font=FONT_LABEL, bg=BG_CARD, fg="#a6e3a1", justify="left")
         self._md_status.pack(padx=8, pady=(0, 6), anchor="w")
 
+        orient_row = tk.Frame(md_frame, bg=BG_CARD)
+        orient_row.pack(fill="x", padx=8, pady=(0, 6))
+        self._unwrap_rotvec_var = tk.BooleanVar(value=bool(self._current_unwrap_rotvec))
+        tk.Checkbutton(
+            orient_row, text="unwrap_rotvec (체크=v20 축각 / 해제=v19 RPY)",
+            variable=self._unwrap_rotvec_var, font=FONT_BTN_SM,
+            bg=BG_CARD, fg=FG, selectcolor=BG_CARD, activebackground=BG_CARD,
+            command=self._toggle_unwrap_rotvec,
+        ).pack(side="left")
+
         self._refresh_checkpoints()
         self._refresh_datasets()
 
@@ -290,13 +310,29 @@ class ControlPanel:
 
         bool_row = tk.Frame(vla_frame, bg=BG_CARD)
         bool_row.pack(fill="x", padx=8, pady=(0, 4))
-        for key, default in _VLA_BOOL_PARAMS:
+        for key, default, label in _VLA_BOOL_PARAMS:
             var = tk.BooleanVar(value=bool(self._vla_params.get(key, default)))
             tk.Checkbutton(
-                bool_row, text=key, variable=var, font=FONT_BTN_SM,
+                bool_row, text=label, variable=var, font=FONT_BTN_SM,
                 bg=BG_CARD, fg=FG, selectcolor=BG_CARD, activebackground=BG_CARD,
             ).pack(side="left", padx=4)
             self._vla_bool_vars[key] = var
+
+        self._vla_choice_vars: Dict[str, tk.StringVar] = {}
+        choice_row = tk.Frame(vla_frame, bg=BG_CARD)
+        choice_row.pack(fill="x", padx=8, pady=(0, 4))
+        for key, choices, default in _VLA_CHOICE_PARAMS:
+            cell = tk.Frame(choice_row, bg=BG_CARD)
+            cell.pack(side="left", padx=4)
+            tk.Label(cell, text=f"{key}:", font=FONT_BTN_SM, bg=BG_CARD, fg=FG).pack(side="left")
+            current = str(self._vla_params.get(key, default))
+            if current not in choices:
+                current = default
+            var = tk.StringVar(value=current)
+            ttk.Combobox(
+                cell, textvariable=var, values=choices, state="readonly", width=10,
+            ).pack(side="left", padx=(4, 0))
+            self._vla_choice_vars[key] = var
 
         self._vla_param_status = tk.Label(vla_frame, text="", font=FONT_BTN_SM, bg=BG_CARD, fg="#a6e3a1")
         self._vla_param_status.pack(padx=8, pady=(0, 2))
@@ -535,7 +571,8 @@ class ControlPanel:
                         hsv = _cv2.cvtColor(bgr, _cv2.COLOR_BGR2HSV)
 
                         # 노랑 마스크 → cyan overlay (좌우 15% 배제)
-                        mask_y = _cv2.inRange(hsv, _np.array([22, 150, 120]), _np.array([32, 255, 255]))
+                        # mask_y = _cv2.inRange(hsv, _np.array([22, 150, 120]), _np.array([32, 255, 255]))  # 기존 노란색 기준
+                        mask_y = _cv2.inRange(hsv, _np.array([10, 150, 120]), _np.array([26, 255, 255]))
                         mask_y = _cv2.erode(mask_y, None, iterations=2)
                         mask_y = _cv2.dilate(mask_y, None, iterations=2)
                         y_left  = int(w * 0.15)
@@ -670,11 +707,18 @@ class ControlPanel:
         self._teleop_btn.config(text="○  Teleop OFF", bg="#e74c3c")
         threading.Thread(target=self._go_home_fn, daemon=True).start()
 
+    def _rec_lock_ctx(self):
+        """recorder.add_frame()과 start_episode()/end_episode()가 절대 동시에
+        episode_buffer를 건드리지 못하게 하는 락. 없으면 아무 것도 안 하는 컨텍스트."""
+        import contextlib
+        return self._recorder_lock if self._recorder_lock is not None else contextlib.nullcontext()
+
     def _toggle_record(self):
         if self._recorder is None:
             return
         if not self._recorder.is_recording:
-            self._recorder.start_episode()
+            with self._rec_lock_ctx():
+                self._recorder.start_episode()
             self._rec_btn.config(text="■  Stop", bg="#e74c3c")
             self._rec_status.config(text=f"Recording episode {self._recorder._episode_count}...")
         else:
@@ -685,7 +729,8 @@ class ControlPanel:
                 status_text = "Save error: unknown"
                 status_color = "#f38ba8"
                 try:
-                    ok = self._recorder.end_episode(save=True, record_queue=self._record_queue)
+                    with self._rec_lock_ctx():
+                        ok = self._recorder.end_episode(save=True, record_queue=self._record_queue)
                     count = self._recorder._episode_count
                     if ok:
                         status_text = f"Saved. Total: {count} episodes"
@@ -707,7 +752,8 @@ class ControlPanel:
 
     def _discard_episode(self):
         if self._recorder and self._recorder.is_recording:
-            self._recorder.end_episode(save=False)
+            with self._rec_lock_ctx():
+                self._recorder.end_episode(save=False)
             self._rec_btn.config(text="● Record", bg="#2ecc71")
             self._rec_status.config(text="Episode discarded.")
 
@@ -800,8 +846,10 @@ class ControlPanel:
             except ValueError:
                 self._vla_param_status.config(text=f"잘못된 값: {key}={raw}", fg="#f38ba8")
                 return
-        for key, _default in _VLA_BOOL_PARAMS:
+        for key, _default, _label in _VLA_BOOL_PARAMS:
             new_values[key] = self._vla_bool_vars[key].get()
+        for key, _choices, _default in _VLA_CHOICE_PARAMS:
+            new_values[key] = self._vla_choice_vars[key].get()
         if self._set_vla_params_fn is not None:
             try:
                 self._set_vla_params_fn(new_values)
@@ -870,6 +918,15 @@ class ControlPanel:
                 self._gripper.set_position(int(self._pos_var.get()))
             except ValueError:
                 pass
+
+    def _toggle_unwrap_rotvec(self):
+        enabled = self._unwrap_rotvec_var.get()
+        if self._set_unwrap_rotvec_fn is None:
+            return
+        try:
+            self._set_unwrap_rotvec_fn(enabled)
+        except Exception as e:
+            print(f"[Orientation] 오류: {e}")
 
     def _toggle_admittance(self):
         turning_on = not self._admittance_on

@@ -48,30 +48,6 @@ def _detect_color_centroid(img_bgr, lower_hsv, upper_hsv):
     return cx, cy
 
 
-def _detect_color_blobs(img_bgr, lower_hsv, upper_hsv):
-    """HSV 범위로 검출된 픽셀을 개별 blob(connected component) 단위로 분리해
-    각 blob의 중심 좌표와 면적을 반환. x좌표(왼쪽→오른쪽) 순으로 정렬된 리스트."""
-    import cv2 as _cv2
-    import numpy as _np2
-    hsv = _cv2.cvtColor(img_bgr, _cv2.COLOR_BGR2HSV)
-    mask = _cv2.inRange(hsv, _np2.array(lower_hsv), _np2.array(upper_hsv))
-    mask = _cv2.erode(mask, None, iterations=2)
-    mask = _cv2.dilate(mask, None, iterations=2)
-    _, _w = mask.shape
-    mask[:, :int(_w * _COLOR_ROI_LEFT)]  = 0
-    mask[:, int(_w * _COLOR_ROI_RIGHT):] = 0
-    n_labels, _labels, stats, centroids = _cv2.connectedComponentsWithStats(mask, connectivity=8)
-    blobs = []
-    for i in range(1, n_labels):  # 0번 라벨은 배경
-        area = stats[i, _cv2.CC_STAT_AREA]
-        if area < _MIN_AREA_COLOR:
-            continue
-        cx, cy = centroids[i]
-        blobs.append({"cx": int(cx), "cy": int(cy), "area": int(area)})
-    blobs.sort(key=lambda b: b["cx"])
-    return blobs
-
-
 def _detect_cable_tip(img_bgr):
     """케이블(검정) ROI 적용 후 하단 tip 픽셀 좌표 반환. 검출 실패 시 None."""
     import cv2 as _cv2
@@ -111,7 +87,8 @@ def compute_alignment_xyz(img_bgr, wrist_cam):
     """
     import numpy as _np2
     _FIXED_DEPTH = 0.30
-    yellow = _detect_color_centroid(img_bgr, [22, 150, 120], [32, 255, 255])
+    # yellow = _detect_color_centroid(img_bgr, [22, 150, 120], [32, 255, 255])  # 기존 노란색 기준
+    yellow = _detect_color_centroid(img_bgr, [10, 150, 120], [26, 255, 255])
     cable  = _detect_cable_tip(img_bgr)
     if yellow is None or cable is None:
         return _np2.zeros(3, dtype=_np2.float32)
@@ -383,6 +360,10 @@ def main():
     from gello.ui.control_panel import ControlPanel
 
     # LeRobot recorder (카메라 없이도 state/action 저장 가능)
+    # _rec_lock: recorder.add_frame()과 recorder.start_episode()/end_episode()가
+    # 절대 동시에 실행되지 않도록 하는 락. 둘 다 이 락 없이 동시에 episode_buffer를
+    # 건드리면 save_episode() 도중 버퍼가 반쯤 변형된 상태로 충돌한다(KeyError('size') 등).
+    _rec_lock = threading.Lock()
     recorder = None
     cameras = {}
     set_dataset_fn = None
@@ -745,6 +726,117 @@ def main():
                 print(f"[VLA] yaml 저장 실패: {e}")
             print(f"[VLA] 체크포인트 선택됨: {pretrained_model_path} (다음 실행 시 로드)")
 
+        # ── VLA 데모 녹화(부산물) ──────────────────────────────────────────────
+        # 실행 중인 체크포인트(v19/v20)와 무관하게, 현재 선택된 데이터셋 이름에 따라
+        # 인코딩 방식을 결정한다: 이름에 "v19"/"v21"이 들어가면 RPY(v19) 방식,
+        # 그 외(v20 등)에는 축각+unwrap(v20) 방식. Recording 토글이 꺼져 있으면
+        # (recorder.is_recording=False) 아무 작업도 하지 않는다.
+        # direct_robot(left_robot)의 내부 _prev_tcp_pos/_prev_tcp_rotvec 추적 변수는
+        # 절대 재사용하지 않고, 여기서만 쓰는 독립 변수로 unwrap 연속성을 유지한다.
+        # 아래 상태는 vla_demo_fn 호출마다 새로 만들지 않고 세션 전체에서 유지해야
+        # (버튼을 여러 번 눌러도 같은 에피소드가 이어지는 경우) 경계에서 프레임이
+        # 끊기지 않는다. _rec_lock으로 폴러/run_inference 콜백이 절대 동시에
+        # recorder.add_frame()을 호출하지 못하게 막는다(경쟁 상태로 인한 버퍼 손상 방지).
+        _rec_prev_rotvec = [None]
+        _rec_pending = [None]  # (state_9dim, imgs, rotvec_or_rpy, gripper_t)
+        _RPY_STYLE_MARKERS = ("v19", "v21")
+
+        def _rec_wants_rpy_style():
+            name = Path(dataset_cfg.get("dir", "")).expanduser().name.lower()
+            return any(m in name for m in _RPY_STYLE_MARKERS)
+
+        # DATC 그리퍼는 위치 피드백이 없어 obs["gripper_position"]이 항상 0으로 고정되어
+        # 있다(ur.py). 그래서 state/action의 그리퍼 채널은 "관측값"이 아니라 "실제로
+        # 하드웨어에 보낸 마지막 명령값"을 직접 추적해서 기록해야 의미가 있다.
+        # t 스케일(0~1)은 run_vla.py의 gripper_pos = 990 - t*(990-1) 변환과 동일한 기준.
+        _rec_gripper_t = [1.0]  # 사전 티칭 후 그리퍼가 닫혀 케이블을 쥔 상태를 기본값으로 가정
+
+        def _rec_note_gripper_raw(raw_value):
+            """set_gripper()처럼 raw(0~1000) 명령을 보낼 때 호출해 t로 변환 후 기록."""
+            _rec_gripper_t[0] = max(0.0, min(1.0, (990 - raw_value) / 989.0))
+
+        def _vla_record_step(obs, imgs):
+            if recorder is None or not recorder.is_recording:
+                # 녹화가 꺼져 있는 동안엔 대기 프레임을 반드시 비워서, 다음 에피소드가
+                # 시작될 때 이전 에피소드의 마지막 프레임이 섞여 들어가지 않게 한다.
+                with _rec_lock:
+                    _rec_pending[0] = None
+                    _rec_prev_rotvec[0] = None
+                return
+            try:
+                rpy_style = _rec_wants_rpy_style()
+                if rpy_style:
+                    orient_now = obs["tcp_rpy"]  # unwrap과 무관하게 항상 raw RPY로 제공됨
+                else:
+                    from gello.robots.ur import _unwrap_rotvec as _rec_unwrap
+                    raw_rotvec = obs["tcp_rotvec"]
+                    orient_now = (raw_rotvec if _rec_prev_rotvec[0] is None
+                                  else _rec_unwrap(raw_rotvec, _rec_prev_rotvec[0]))
+
+                wrist_img = imgs.get("wrist")
+                wrist_cam = cameras.get("wrist")
+                if wrist_img is not None and wrist_cam is not None:
+                    import cv2 as _cv2_rec
+                    align_xyz = compute_alignment_xyz(
+                        _cv2_rec.cvtColor(wrist_img, _cv2_rec.COLOR_RGB2BGR), wrist_cam)
+                else:
+                    align_xyz = _np.zeros(3, dtype=_np.float32)
+
+                # DATC는 위치 피드백이 없어 obs["gripper_position"]은 항상 0 — 대신
+                # 실제로 마지막에 전송한 명령값(_rec_gripper_t)을 그리퍼 상태로 사용한다.
+                gripper_now = _np.array([_rec_gripper_t[0]], dtype=_np.float32)
+
+                state_now = _np.concatenate([
+                    obs["tcp_xyz_delta"], orient_now, gripper_now, align_xyz[:2],
+                ]).astype(_np.float32)
+
+                with _rec_lock:
+                    if _rec_pending[0] is not None:
+                        prev_state, prev_imgs, prev_orient, prev_gripper = _rec_pending[0]
+                        if rpy_style:
+                            rot_delta = orient_now - prev_orient  # v19: 성분별 단순 차
+                        else:
+                            from scipy.spatial.transform import Rotation as _RecR
+                            rot_delta = (_RecR.from_rotvec(orient_now)
+                                         * _RecR.from_rotvec(prev_orient).inv()).as_rotvec()
+                        action = _np.concatenate([
+                            obs["tcp_xyz_delta"],   # 직전 샘플→현재 샘플 실제 이동량
+                            rot_delta,
+                            gripper_now - prev_gripper,
+                        ]).astype(_np.float32)
+                        recorder.add_frame(state=prev_state, action=action, images=prev_imgs)
+
+                    _rec_pending[0] = (state_now, imgs, orient_now, gripper_now.copy())
+                    _rec_prev_rotvec[0] = orient_now.copy() if not rpy_style else None
+            except Exception as _rec_e:
+                print(f"[VLA-Record] 프레임 기록 실패: {_rec_e}")
+
+        # 사전 티칭/삽입 구간(moveL 동기 호출이라 스텝 루프가 없음)을 위한 저해상도 폴러.
+        # run_inference가 obs를 전담하는 동안(ACT 추론 구간)에는 반드시 pause 해서
+        # left_robot의 공유 델타 추적 변수를 동시에 건드리지 않도록 한다.
+        # 앱 전체 수명 동안 단 한 번만 시작한다(버튼을 누를 때마다 새로 만들지 않음).
+        _rec_poll_pause = threading.Event()
+        _rec_poll_stop = threading.Event()
+
+        def _vla_recorder_poll_loop():
+            while not _rec_poll_stop.is_set():
+                if _rec_poll_pause.is_set() or recorder is None or not recorder.is_recording:
+                    time.sleep(0.05)
+                    continue
+                try:
+                    obs_r = left_robot.get_observations(full=False)
+                    imgs_r = {}
+                    for _k, _cam in cameras.items():
+                        _img_r, _ = _cam.read()
+                        imgs_r[_k] = _img_r
+                    _vla_record_step(obs_r, imgs_r)
+                except Exception as _poll_e:
+                    print(f"[VLA-Record] poll 오류: {_poll_e}")
+                time.sleep(1.0 / 15)
+
+        _rec_poll_thread = threading.Thread(target=_vla_recorder_poll_loop, daemon=True)
+        _rec_poll_thread.start()
+
         def vla_demo_fn():
             if _vla_policy[0] is None:
                 print(f"[VLA] 정책 로딩 중... (device={_vla_device})")
@@ -753,6 +845,7 @@ def main():
                 print("[VLA] 정책 로딩 완료.")
             else:
                 print(f"[VLA] 이미 로드된 정책 재사용: {_vla_checkpoint[0]}")
+
             _vla_stop.clear()
             teleop_event.clear()
             time.sleep(0.3)  # 제어루프 마지막 servoJ 전송 완료 대기
@@ -835,9 +928,10 @@ def main():
                 finally:
                     _wd_stop.set()
 
-            def set_gripper(value, label=""):
+            def set_gripper(value, label="", wait=1.0):
                 """그리퍼 직접 제어. value = raw position (0=닫힘, 1000=열림)."""
                 print(f"[Hybrid] {label}")
+                _rec_note_gripper_raw(value)  # 녹화용: 실제로 보낸 명령값 기록 (성공 여부와 무관히 의도값 기준)
                 if gripper is None:
                     print("[Hybrid] gripper 없음 — 건너뜀")
                     return
@@ -845,7 +939,8 @@ def main():
                     gripper.set_position(int(value))
                 except Exception as e:
                     print(f"[Hybrid] gripper 제어 실패: {e}")
-                time.sleep(1.0)
+                if wait > 0:
+                    time.sleep(wait)
 
             def move_z_fixed_rp(z_target, label="", speed=0.025, accel=0.15, tcp_frame=False):
                 """z를 이동. tcp_frame=True이면 TCP z축 방향으로 이동 (base_z가 z_target에 도달하도록)."""
@@ -928,50 +1023,56 @@ def main():
                 finally:
                     _wd_stop2.set()
 
-            def move_home(label="6. home 자세", speed=0.5, accel=0.5):
+            def move_home(label="6. home 자세", speed=0.7, accel=1.4):
                 """홈 자세로 관절 공간 이동 (moveJ)."""
                 if _vla_stop.is_set():
                     return False
                 print(f"[Hybrid] {label}")
+
+                # STOP watchdog: 20ms 간격으로 감시, 감지 시 즉시 stopJ
+                _wd_stop3 = threading.Event()
+                def _watchdog3():
+                    while not _wd_stop3.wait(timeout=0.02):
+                        if _vla_stop.is_set():
+                            try:
+                                left_robot.robot.stopJ(2.0)
+                            except Exception:
+                                pass
+                            return
+                threading.Thread(target=_watchdog3, daemon=True).start()
+
                 try:
                     left_robot.robot.moveJ(_HOME_RAD, speed, accel)
-                    return True
+                    return not _vla_stop.is_set()
                 except Exception as e:
                     print(f"[Hybrid] moveJ 실패: {e}")
                     return False
+                finally:
+                    _wd_stop3.set()
+
+            # ── 0단계: 체결 이동 (home 경유 전, Finger Change 토글로 on/off) ──
+            if vla_cfg.get("finger_change", True):
+                if not move_cs(_PRE_FASTEN_CS, "0-1. 체결 전", speed=0.3, accel=0.60):
+                    return
+                if not move_cs(_FASTEN_CS,     "0-2. 체결 자세", speed=0.05, accel=0.1):
+                    return
+                if not move_cs(_POST_FASTEN_CS, "0-3. 체결 후", speed=0.1, accel=0.2):
+                    return
 
             # ── 1단계: 사전 티칭 동작 ───────────────────────────────────────
-            if not move_home("1. home 경유"):                            return
-
-            # home 도착 직후: 노란색 ROI 내 blob 개수 검출 및 번호가 매겨진 스냅샷 저장
-            _wrist_cam_snap = cameras.get("wrist")
-            if _wrist_cam_snap is not None:
-                try:
-                    import cv2 as _cv2_snap
-                    import os as _os_snap
-                    _img_rgb_snap, _ = _wrist_cam_snap.read()
-                    _img_bgr_snap = _cv2_snap.cvtColor(_img_rgb_snap, _cv2_snap.COLOR_RGB2BGR)
-                    _yellow_blobs = _detect_color_blobs(_img_bgr_snap, [22, 150, 120], [32, 255, 255])
-                    print(f"[Hybrid] home 도착 직후 노란색 blob 검출: {len(_yellow_blobs)}개")
-                    for _i, _b in enumerate(_yellow_blobs, start=1):
-                        _cv2_snap.circle(_img_bgr_snap, (_b["cx"], _b["cy"]), 8, (0, 255, 255), -1)
-                        _cv2_snap.putText(_img_bgr_snap, f"yellow {_i}", (_b["cx"] + 10, _b["cy"]),
-                                           _cv2_snap.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                    _snap_dir = _os_snap.path.expanduser("~/vla_home_snapshots")
-                    _os_snap.makedirs(_snap_dir, exist_ok=True)
-                    _snap_path = _os_snap.path.join(_snap_dir, f"home_yellow_{int(time.time())}.png")
-                    _cv2_snap.imwrite(_snap_path, _img_bgr_snap)
-                    print(f"[Hybrid] 스냅샷 저장: {_snap_path}")
-                except Exception as _e:
-                    print(f"[Hybrid] 노란색 blob 스냅샷 실패: {_e}")
-            set_gripper(_GRIPPER_OPEN,      "2. gripper open")
-            time.sleep(0.5)
-            if not move_cs(_PRE_GRASP_CS,  "3. 케이블 파지 전 자세"): return
-            if not move_cs(_GRASP_CS,       "4. 케이블 파지 자세"):   return
+            if not move_home("1. home 경유"):
+                return
+            set_gripper(_GRIPPER_OPEN,      "2. gripper open", wait=0)
+            if not move_cs(_PRE_GRASP_CS,  "3. 케이블 파지 전 자세", speed=0.3, accel=0.6):
+                return
+            if not move_cs(_GRASP_CS,       "4. 케이블 파지 자세", speed=0.3, accel=0.6):
+                return
             set_gripper(_GRIPPER_CLOSE,     "5. gripper close")
             time.sleep(0.5)
-            if not move_cs(_POST_GRASP_CS,  "6. 케이블 파지 후 자세"): return
-            if not move_home("7. home"):                                 return
+            if not move_cs(_POST_GRASP_CS,  "6. 케이블 파지 후 자세", speed=0.3, accel=0.6):
+                return
+            if not move_home("7. home"):
+                return
 
             # ── 2단계: VLA 추론 ─────────────────────────────────────────────
             print("[Hybrid] 사전 동작 완료. VLA 추론 시작.")
@@ -985,33 +1086,47 @@ def main():
             _z_floor    = vla_cfg.get("z_floor")
             _z_insert   = vla_cfg.get("z_insert", 0.24)
             _align_thr  = vla_cfg.get("align_insert_threshold", 0.002)
-            insertion_ready = run_inference(
-                env=env,
-                cameras=cameras,
-                policy=_vla_policy[0],
-                stats=_vla_stats[0] or {},
-                device=_vla_device,
-                fps=cfg.get("hz", 30),
-                chunk_size=vla_cfg.get("chunk_size", 20),
-                stop_event=_vla_stop,
-                speed_scale=vla_cfg.get("speed_scale", 1.0),
-                delta_scale=vla_cfg.get("delta_scale", 1.0),
-                use_servoing=vla_cfg.get("use_servoing", False),
-                fix_orientation=vla_cfg.get("fix_orientation", False),
-                direct_robot=left_robot,
-                z_approach_threshold=_z_approach,
-                z_floor=_z_floor,
-                use_z_freeze=vla_cfg.get("use_z_freeze", False),
-                align_insert_threshold=_align_thr,
-                cartesian_action=_cartesian_action,
-                control_gripper=vla_cfg.get("control_gripper", True),
-                admittance_gain=_eff_gain,
-                admittance_deadband=vla_cfg.get("admittance_deadband", 3.0),
-                admittance_spring_k=vla_cfg.get("admittance_spring_k", 0.0),
-                admittance_damping_b=vla_cfg.get("admittance_damping_b", 0.0),
-            )
+            # 그리퍼 기준값 트래킹은 state도 실제 값으로 학습된 체크포인트(v21)에서만
+            # 켠다 — v19처럼 state가 항상 0으로 학습된 체크포인트에 켜면 다른 축(z 등)
+            # 예측까지 같이 흔들린다(체크포인트 경로 이름으로 판별).
+            _gripper_baseline_from_track = "v21" in str(_vla_checkpoint[0]).lower()
+            # ACT 추론 구간에서는 run_inference가 obs를 전담하므로 폴러를 잠시 멈춘다
+            # (left_robot의 공유 델타 추적 변수를 동시에 건드리지 않기 위함).
+            _rec_poll_pause.set()
+            try:
+                insertion_ready = run_inference(
+                    env=env,
+                    cameras=cameras,
+                    policy=_vla_policy[0],
+                    stats=_vla_stats[0] or {},
+                    device=_vla_device,
+                    fps=cfg.get("hz", 30),
+                    chunk_size=vla_cfg.get("chunk_size", 20),
+                    stop_event=_vla_stop,
+                    speed_scale=vla_cfg.get("speed_scale", 1.0),
+                    delta_scale=vla_cfg.get("delta_scale", 1.0),
+                    fix_orientation=vla_cfg.get("fix_orientation", False),
+                    direct_robot=left_robot,
+                    z_approach_threshold=_z_approach,
+                    z_floor=_z_floor,
+                    use_z_freeze=vla_cfg.get("use_z_freeze", False),
+                    align_insert_threshold=_align_thr,
+                    cartesian_action=_cartesian_action,
+                    control_gripper=vla_cfg.get("control_gripper", True),
+                    admittance_gain=_eff_gain,
+                    admittance_deadband=vla_cfg.get("admittance_deadband", 3.0),
+                    admittance_spring_k=vla_cfg.get("admittance_spring_k", 0.0),
+                    admittance_damping_b=vla_cfg.get("admittance_damping_b", 0.0),
+                    record_cb=_vla_record_step,
+                    gripper_cmd_cb=lambda t: _rec_gripper_t.__setitem__(0, t),
+                    gripper_baseline_from_track=_gripper_baseline_from_track,
+                )
+            finally:
+                _rec_poll_pause.clear()  # 삽입 시퀀스 구간부터 폴러 재개
 
             # ── 3단계: 삽입 시퀀스 (z+align 조건 충족 시) ─────────────────
+            # use_z_freeze="act"는 삽입 조건 체크 자체가 없어 insertion_ready가 항상
+            # False이므로, 이 블록은 자동으로 건너뛰어지고 STOP으로만 종료된다.
             if insertion_ready:
                 print("[VLA] 삽입 시퀀스 시작")
                 _vla_stop.clear()
@@ -1022,13 +1137,23 @@ def main():
                 time.sleep(0.1)
                 if move_z_fixed_rp(_z_insert, f"삽입 z={_z_insert}", tcp_frame=True):
                     set_gripper(_GRIPPER_OPEN, "그리퍼 open")
-                    move_z_fixed_rp(0.34, "삽입 후 복귀 z=0.34", tcp_frame=True)
+                    move_z_fixed_rp(0.34, "삽입 후 복귀 z=0.34", speed=0.3, accel=0.6, tcp_frame=True)
 
             # ── 4단계: home 복귀 ─────────────────────────────────────────────
             if insertion_ready:
                 set_gripper(_GRIPPER_CLOSE, "그리퍼 close")
                 print("[VLA] home 복귀")
                 move_home("home 복귀")
+
+            # ── 5단계: 체결 이동 복귀 (home 복귀 이후, Finger Change 토글로 on/off) ──
+            if vla_cfg.get("finger_change", True):
+                if not move_cs(_POST_FASTEN_CS, "5-1. 체결 후", speed=0.3, accel=0.60):
+                    return
+                if not move_cs(_FASTEN_CS,      "5-2. 체결 자세", speed=0.05, accel=0.1):
+                    return
+                if not move_cs(_PRE_FASTEN_CS,  "5-3. 체결 전", speed=0.1, accel=0.2):
+                    return
+                move_home("5-4. home 복귀")
 
 
     estop_fn = getattr(left_robot, "stop", None)
@@ -1056,6 +1181,11 @@ def main():
     _PRE_GRASP_CS  = [-0.46883, -0.54319, 0.41521,  179.989,  0.002, -179.997]  # 1. 케이블 파지 전 자세
     _GRASP_CS      = [-0.46882, -0.54321, 0.26036,  179.988,  0.002, -179.995]  # 3. 케이블 파지 자세
     _POST_GRASP_CS = [-0.46883, -0.54319, 0.41521,  179.989,  0.002, -179.997]  # 5. 케이블 파지 후 자세
+
+    # ── home 경유 전 체결 이동 (CS: x, y, z [m] / rx, ry, rz [deg]) ──
+    _PRE_FASTEN_CS   = [0.03526, -0.65318, 0.22504, 135.276, -0.040, 90.035]  # 체결 전
+    _FASTEN_CS       = [0.08256, -0.65314, 0.17735, 135.276, -0.033, 90.038]  # 체결 자세
+    _POST_FASTEN_CS  = [0.21965, -0.65312, 0.31311, 135.278, -0.035, 90.035]  # 체결 후
 
     _GRIPPER_OPEN  = 500   # gripper open (0=닫힘, 1000=열림)
     _GRIPPER_CLOSE = 0     # gripper close
@@ -1168,10 +1298,23 @@ def main():
         if _ckpt_path.name == "pretrained_model" and _ckpt_path.parent.parent.name == "checkpoints":
             _current_checkpoint_label = f"{_ckpt_path.parent.parent.parent.name}/{_ckpt_path.parent.name}"
 
+    def set_unwrap_rotvec_fn(enabled: bool):
+        """UI 토글: v19(RPY)/v20(축각+unwrap) 실행 모드 전환. 텔레옵/VLA 실행 중엔 막는다."""
+        if teleop_event.is_set() or not _vla_stop.is_set():
+            print("[Orientation] 텔레옵/VLA 실행 중에는 orientation 모드를 바꿀 수 없습니다.")
+            return
+        left_robot.set_unwrap_rotvec(enabled)
+        try:
+            _update_yaml_scalar(args.left_config_path, "unwrap_rotvec", enabled)
+        except Exception as e:
+            print(f"[Orientation] yaml 저장 실패: {e}")
+        print(f"[Orientation] unwrap_rotvec={enabled} ({'v20 축각' if enabled else 'v19 RPY'}) 로 전환")
+
     panel = ControlPanel(
         teleop_event=teleop_event,
         gripper=gripper,
         recorder=recorder,
+        recorder_lock=_rec_lock,
         vla_demo_fn=vla_demo_fn,
         gello_robot=gello_robot,
         gc_xml_path=gc_cfg.get("xml_path"),
@@ -1191,6 +1334,8 @@ def main():
         current_dataset=_current_dataset_name,
         set_checkpoint_fn=set_checkpoint_fn,
         set_dataset_fn=set_dataset_fn,
+        set_unwrap_rotvec_fn=set_unwrap_rotvec_fn,
+        current_unwrap_rotvec=bool(left_robot_cfg.get("unwrap_rotvec", False)),
         vla_params=vla_cfg,
         set_vla_params_fn=set_vla_params_fn,
         start_act_training_fn=start_act_training_fn,

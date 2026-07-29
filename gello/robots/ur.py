@@ -183,6 +183,12 @@ class URRobot(Robot):
         self._prev_tcp_pos = None
         self._prev_tcp_rotvec = None
 
+    def set_unwrap_rotvec(self, enabled: bool) -> None:
+        """v19/v20 orientation 모드를 실행 중에 전환. 체크포인트 전환 시(UI 토글)
+        반드시 델타 추적도 같이 리셋해야 이전 모드의 값이 섞이지 않는다."""
+        self._unwrap_rotvec_enabled = enabled
+        self.reset_delta_tracking()
+
     def get_observations(self, full: bool = True) -> Dict[str, np.ndarray]:
         joints = self.get_joint_state()
         joint_vels = np.array(self.r_inter.getActualQd())

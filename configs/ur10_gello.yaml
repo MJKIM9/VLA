@@ -27,8 +27,8 @@ gravity_comp:
   torque_to_pwm: [5, 13, 13, 10, 6, 6]
 
 dataset:
-  dir: ~/datasets/ur10_task_v19
-  repo_id: koras/ur10_task_v19
+  dir: ~/datasets/ur10_task_v21
+  repo_id: koras/ur10_task_v21
   task_name: teleoperation
   cartesian_action: true     # v20: action = tcp_xyz_delta(3) + tcp_rotvec_delta(3) + gripper_delta(1) = 7
   use_exterior_camera: false # v20: wrist 카메라만 입력으로 사용, exterior 제외
@@ -39,12 +39,11 @@ vla:
   speed_scale: 2.0
   delta_scale: 1.0
   control_gripper: false
-  use_servoing: false
   fix_orientation: false
   z_approach: 0.295
   z_floor: 0.29
-  use_z_freeze: servoing   # false: z_floor 하한선만 / "act": z 고정+ACT xy 제어 / "servoing": z 고정+서보잉 xy 제어
-  z_insert: 0.24
+  use_z_freeze: servoing  # false: z_floor 하한선만(ACT xy) / "act": freeze/삽입조건 없이 끝까지 ACT / "servoing": 처음부터 xy는 서보잉이 전담, z는 approach 도달 후 고정
+  z_insert: 0.233
   align_insert_threshold: 0.004
   admittance_gain: 0.0001  # 0.0: 비활성 / VLA 추론 중 소프트웨어 어드미턴스 gain (작은 힘에도 부드럽게 반응)
   admittance_deadband: 1.0  # N: 이 이하 힘은 노이즈로 무시

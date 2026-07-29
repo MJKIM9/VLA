@@ -236,7 +236,8 @@ class _AlignBuffer:
 def compute_alignment_xyz(img_bgr, wrist_cam) -> np.ndarray:
     """손목 카메라에서 케이블(검정) tip - 노란 물체의 xy 오정렬 벡터(미터) 반환.
     depth 센서 대신 고정 작업거리로 픽셀 → 미터 변환 (z=0)."""
-    yellow = _detect_color_centroid(img_bgr, [22, 150, 120], [32, 255, 255])
+    # yellow = _detect_color_centroid(img_bgr, [22, 150, 120], [32, 255, 255])  # 기존 노란색 기준
+    yellow = _detect_color_centroid(img_bgr, [10, 150, 120], [26, 255, 255])
     cable  = _detect_cable_tip(img_bgr)
     if yellow is None or cable is None:
         return np.zeros(3, dtype=np.float32)
@@ -362,7 +363,6 @@ def run_inference(
     speed_scale: float = 1.0,
     delta_scale: float = 1.0,
     direct_robot=None,
-    use_servoing: bool = True,
     fix_orientation: bool = False,
     z_approach_threshold: float = None,
     z_floor: float = None,
@@ -374,11 +374,26 @@ def run_inference(
     admittance_deadband: float = 3.0,
     admittance_spring_k: float = 0.0,
     admittance_damping_b: float = 0.0,
+    record_cb=None,
+    gripper_cmd_cb=None,
+    gripper_baseline_from_track: bool = False,
 ) -> bool:
     """Main inference loop. Runs until stop_event is set.
 
     direct_robot: URRobot 인스턴스를 직접 전달하면 ZMQ 없이 로봇 직접 제어.
                   None이면 기존 env(ZMQ) 경로 사용.
+    gripper_baseline_from_track: True면 그리퍼 목표값 계산 시 항상 0인 q_current[6]
+                  대신, 실제로 마지막에 보낸 명령값을 기준으로 델타를 누적한다.
+                  state의 그리퍼 채널도 실제 값으로 학습된 체크포인트(예: v21)에서만
+                  켜야 한다 — state가 항상 0으로 학습된 체크포인트(v19)에 켜면
+                  학습-추론 분포가 달라져 다른 축(z 등) 예측까지 영향을 받는다.
+    gripper_cmd_cb: (t: float) -> None. control_gripper=True로 실제 DATC에 그리퍼
+                  명령을 보낼 때마다(0~1 정규화 값) 호출된다. DATC는 위치 피드백이
+                  없어 obs로는 그리퍼 상태를 알 수 없으므로, 녹화 쪽에서 "실제로
+                  보낸 명령"을 추적하는 용도.
+    record_cb: (obs, imgs) -> None. 매 스텝, 실제 이동을 적용하기 *직전*의 obs(및 그 시점
+               카메라 프레임)로 호출된다. 호출부에서 recorder.is_recording 여부를 직접 체크하며,
+               제어 흐름에는 관여하지 않는다(부산물 기록 전용).
     반환값: True = z+align 조건으로 삽입 준비 완료, False = 외부 stop 또는 정상 종료.
     """
     dt = speed_scale / fps
@@ -389,6 +404,8 @@ def run_inference(
     effective_hz = fps / speed_scale
     mode = "직접(ZMQ 우회)" if direct_robot is not None else "ZMQ"
     print(f"[VLA] Starting inference at {fps}Hz × 1/{speed_scale:.1f} = {effective_hz:.1f}Hz effective, chunk_size={chunk_size}, mode={mode}")
+    print(f"[VLA][gripper] control_gripper={control_gripper}, datc_gripper={'있음' if (direct_robot is not None and direct_robot._datc_gripper is not None) else '없음'}, "
+          f"gripper_baseline_from_track={gripper_baseline_from_track}")
     policy.reset()
 
     # 직전(하이브리드 사전 동작 등)의 큰 이동이 첫 tcp_xyz_delta에 섞여 들어가지 않도록
@@ -398,9 +415,17 @@ def run_inference(
     obs = direct_robot.get_observations() if direct_robot is not None else env.get_obs()
     print(f"[VLA][reset] Δxyz/rotvec 리셋 직후 tcp_xyz_delta={obs['tcp_xyz_delta'].tolist()}")
 
+    # gripper_baseline_from_track용 추적값. 사전 티칭 후 그리퍼가 닫혀 케이블을
+    # 쥔 상태로 ACT가 시작되므로 1.0(닫힘)을 기본값으로 둔다.
+    _last_gripper_t = [1.0]
+    if gripper_baseline_from_track:
+        # state도 실제 값으로 학습된 체크포인트(v21)에서만: obs["gripper_position"]이
+        # DATC 피드백 부재로 항상 0인 걸 실제 마지막 명령값으로 덮어쓴다.
+        obs["gripper_position"] = np.array([_last_gripper_t[0]], dtype=np.float32)
+
     # 안전장치: 학습 데이터 통계와 무관한 절대 선속도 상한 (m/s).
     # speed_scale/delta_scale이 적용된 뒤 실제로 servoL에 들어가는 물리적 이동거리 기준.
-    _MAX_LINEAR_SPEED = 0.1  # m/s
+    _MAX_LINEAR_SPEED = 0.2  # m/s
     _max_raw_xyz_norm = (_MAX_LINEAR_SPEED * dt) / max(speed_scale * delta_scale, 1e-9)
 
     # 어드미턴스 스프링 기준점: VLA 추론 시작 시점의 TCP 위치로 복귀
@@ -470,14 +495,6 @@ def run_inference(
     _cached_actions = _infer_chunk(_batch0)
     _step_in_chunk = 0
 
-    # 디버그용 손목 카메라 영상 저장 (VLA Demo 실행 중 전체를 mp4로)
-    import os as _os_dbg
-    _debug_dir = _os_dbg.path.expanduser(f"~/vla_debug_frames/{int(time.time())}")
-    _os_dbg.makedirs(_debug_dir, exist_ok=True)
-    _debug_video_path = f"{_debug_dir}/wrist.mp4"
-    print(f"[VLA] 손목 카메라 디버그 영상 저장 경로: {_debug_video_path}")
-    _debug_video_writer = None
-
     while not stop_event.is_set():
         t0 = time.time()
 
@@ -486,50 +503,6 @@ def run_inference(
             img = cam_buffers[key].get()
             if img is not None:
                 obs[f"observation.images.{key}"] = img
-
-        wrist_img_now = obs.get("observation.images.wrist")
-        if wrist_img_now is not None:
-            import cv2 as _cv2_dbg
-            _bgr_dbg = _cv2_dbg.cvtColor(wrist_img_now, _cv2_dbg.COLOR_RGB2BGR)
-
-            # 케이블(검정) ROI 시각화
-            _h_dbg0, _w_dbg0 = _bgr_dbg.shape[:2]
-            _cv2_dbg.rectangle(
-                _bgr_dbg,
-                (int(_w_dbg0 * _CABLE_ROI_LEFT), int(_h_dbg0 * _CABLE_ROI_TOP)),
-                (int(_w_dbg0 * _CABLE_ROI_RIGHT), int(_h_dbg0 * _CABLE_ROI_BOTTOM)),
-                (255, 255, 0), 1,
-            )
-
-            # 노란 물체 / 케이블 tip 검출 결과 오버레이
-            _yellow_px = _detect_color_centroid(_bgr_dbg, [22, 150, 120], [32, 255, 255])
-            _cable_px = _detect_cable_tip(_bgr_dbg)
-            if _yellow_px is not None:
-                _cv2_dbg.circle(_bgr_dbg, _yellow_px, 6, (0, 255, 255), -1)
-                _cv2_dbg.putText(_bgr_dbg, "yellow", (_yellow_px[0] + 8, _yellow_px[1]),
-                                  _cv2_dbg.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
-            if _cable_px is not None:
-                _cv2_dbg.circle(_bgr_dbg, _cable_px, 6, (255, 0, 0), -1)
-                _cv2_dbg.putText(_bgr_dbg, "cable", (_cable_px[0] + 8, _cable_px[1]),
-                                  _cv2_dbg.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 1)
-            if _yellow_px is not None and _cable_px is not None:
-                _cv2_dbg.line(_bgr_dbg, _yellow_px, _cable_px, (0, 255, 0), 1)
-
-            # 현재 정렬(align_x, align_y) 값 텍스트 표시
-            if _align_buf is not None:
-                _align_xy_dbg = _align_buf.get()
-                _cv2_dbg.putText(
-                    _bgr_dbg,
-                    f"align x={_align_xy_dbg[0]*1000:.1f}mm y={_align_xy_dbg[1]*1000:.1f}mm",
-                    (10, _h_dbg0 - 10), _cv2_dbg.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1,
-                )
-
-            if _debug_video_writer is None:
-                _h_dbg, _w_dbg = _bgr_dbg.shape[:2]
-                _fourcc_dbg = _cv2_dbg.VideoWriter_fourcc(*"mp4v")
-                _debug_video_writer = _cv2_dbg.VideoWriter(
-                    _debug_video_path, _fourcc_dbg, effective_hz, (_w_dbg, _h_dbg))
-            _debug_video_writer.write(_bgr_dbg)
 
         # chunk 첫 step에 다음 chunk 비동기 추론 시작 (15 step × 33ms = 500ms 여유)
         if _step_in_chunk == 0 and _next_future is None:
@@ -549,51 +522,49 @@ def run_inference(
         align_y_val = float(_align_xy[1])         # y: 양수 = cable이 yellow보다 아래 (yellow가 위)
 
 
-        # Visual servoing: ACT와 동일하게 시작/종료, xy delta를 align 비례제어로 대체
-        if use_servoing and np.linalg.norm(_align_xy) > 1e-4:
-            _y_err = _align_xy[1] - _servoing_target_y
-            delta_np[0] = _SERVOING_K * _align_xy[0]
-            delta_np[1] = -_SERVOING_K * _y_err  # y축 부호 반전 + 목표 오프셋(노란점이 목표% 위)
-            print(f"[VLA][servoing] align_y={_align_xy[1]:.4f} target={_servoing_target_y:.4f} "
-                  f"err={_y_err:.4f} dy={delta_np[1]:.5f}")
-
         # z 제어 및 삽입 조건 체크
         if direct_robot is not None:
             try:
                 tcp_z = direct_robot.r_inter.getActualTCPPose()[2]
-                # z_approach 도달 전, ACT의 z 예측이 정체/수렴해 중간에 멈추는 것을 방지하기 위한
-                # 최소 하강 속도 보장. 모델이 이미 이보다 빠르게 내려가고 있으면 그대로 두고,
-                # 느리거나 멈추거나 올라가려 하면 강제로 이 속도로 내려가게 한다.
-                _MIN_DESCENT_RATE = -0.0002  # m/step
-                if (z_approach_threshold is not None and not _z_freeze_mode
-                        and tcp_z > z_approach_threshold
-                        and delta_np[2] > _MIN_DESCENT_RATE):
-                    delta_np[2] = _MIN_DESCENT_RATE
-                if use_z_freeze:
-                    if z_approach_threshold is not None and not _z_freeze_mode and tcp_z <= z_approach_threshold:
-                        _z_freeze_mode = True
-                        print(f"[VLA] Z-freeze 진입 (z={tcp_z:.4f}m, 모드={use_z_freeze})")
-                    if _z_freeze_mode:
-                        delta_np[2] = 0.0
-                        if use_z_freeze == "servoing":
-                            # ACT 출력 무시, 서보잉으로 xy 제어
+                if use_z_freeze == "act":
+                    # freeze도, z_floor도, 삽입 조건 체크도 전혀 없음 — ACT 출력을
+                    # 그대로 사용해 끝까지(삽입까지) 움직인다. 사용자 STOP으로만 종료.
+                    pass
+                else:
+                    # z_approach 도달 전, ACT의 z 예측이 정체/수렴해 중간에 멈추는 것을 방지하기 위한
+                    # 최소 하강 속도 보장. 모델이 이미 이보다 빠르게 내려가고 있으면 그대로 두고,
+                    # 느리거나 멈추거나 올라가려 하면 강제로 이 속도로 내려가게 한다.
+                    _MIN_DESCENT_RATE = -0.001  # m/step
+                    if (z_approach_threshold is not None and not _z_freeze_mode
+                            and tcp_z > z_approach_threshold
+                            and delta_np[2] > _MIN_DESCENT_RATE):
+                        delta_np[2] = _MIN_DESCENT_RATE
+                    if use_z_freeze == "servoing":
+                        # xy는 ACT 추론 시작부터 끝까지 서보잉이 전담 (이전 use_servoing=True와 동일)
+                        if np.linalg.norm(_align_xy) > 1e-4:
                             _y_err = _align_xy[1] - _servoing_target_y
                             delta_np[0] = _SERVOING_K * _align_xy[0]
                             delta_np[1] = -_SERVOING_K * _y_err  # y축 부호 반전 + 목표 오프셋(노란점이 목표% 위)
                             print(f"[VLA][servoing] align_y={_align_xy[1]:.4f} target={_servoing_target_y:.4f} "
                                   f"err={_y_err:.4f} dy={delta_np[1]:.5f}")
-                else:
-                    # z_floor 모드: z_floor 이하 하강 차단
-                    if z_floor is not None and tcp_z <= z_floor:
-                        delta_np[2] = max(delta_np[2], 0.0)
-                # 삽입 조건: 모든 모드 공통
-                if z_approach_threshold is not None and tcp_z <= z_approach_threshold:
-                    _x_ok = 0 < align_x_mag < align_insert_threshold
-                    _y_ok = 0.005 < align_y_val < 0.05
-                    if _x_ok and _y_ok:
-                        print(f"[VLA] 삽입 준비 완료 (x={align_x_mag*1000:.1f}mm, y={align_y_val*1000:.1f}mm)")
-                        _insertion_ready = True
-                        stop_event.set()
+                        # z는 approach threshold 도달 이후에만 고정
+                        if z_approach_threshold is not None and not _z_freeze_mode and tcp_z <= z_approach_threshold:
+                            _z_freeze_mode = True
+                            print(f"[VLA] Z-freeze 진입 (z={tcp_z:.4f}m, 모드={use_z_freeze})")
+                        if _z_freeze_mode:
+                            delta_np[2] = 0.0
+                    else:
+                        # false: z_floor 이하 하강 차단
+                        if z_floor is not None and tcp_z <= z_floor:
+                            delta_np[2] = max(delta_np[2], 0.0)
+                    # 삽입 조건: false/servoing 모드에서만 체크 (act는 자동 정지 없음)
+                    if z_approach_threshold is not None and tcp_z <= z_approach_threshold:
+                        _x_ok = 0 < align_x_mag < align_insert_threshold
+                        _y_ok = 0.002 < align_y_val < 0.012
+                        if _x_ok and _y_ok:
+                            print(f"[VLA] 삽입 준비 완료 (x={align_x_mag*1000:.1f}mm, y={align_y_val*1000:.1f}mm)")
+                            _insertion_ready = True
+                            stop_event.set()
             except Exception:
                 pass
 
@@ -605,6 +576,17 @@ def run_inference(
             print(f"[VLA][safety] 절대 속도 상한({_MAX_LINEAR_SPEED} m/s) 초과, 축소 적용: "
                   f"{np.round(delta_np[:3], 5).tolist()} -> {np.round(delta_np[:3] * _scale, 5).tolist()}")
             delta_np[:3] = delta_np[:3] * _scale
+
+        # 녹화(부산물): 실제 이동을 적용하기 직전의 obs를 그대로 넘김. 제어 흐름과 무관.
+        if record_cb is not None:
+            try:
+                _imgs_for_record = {
+                    k: obs[f"observation.images.{k}"]
+                    for k in cameras if f"observation.images.{k}" in obs
+                }
+                record_cb(obs, _imgs_for_record)
+            except Exception as _rec_e:
+                print(f"[VLA] record_cb 오류: {_rec_e}")
 
         # chunk 소진 시 다음 chunk로 교체
         if _step_in_chunk >= chunk_size:
@@ -673,16 +655,33 @@ def run_inference(
                 tcp_pose = new_xyz + list(new_rv)
                 direct_robot.robot.servoL(tcp_pose, 0.5, 0.5, dt, 0.1, 300)
                 if control_gripper and direct_robot._datc_gripper is not None and len(delta_np) > 6:
-                    cur_gripper = q_current[6] if len(q_current) > 6 else 0.0
+                    if gripper_baseline_from_track:
+                        # q_current[6]은 DATC 피드백 부재로 항상 0이라, 실제 마지막
+                        # 명령값을 기준으로 델타를 누적해야 한다(v21처럼 state도
+                        # 실제 값으로 학습된 체크포인트 전용).
+                        cur_gripper = _last_gripper_t[0]
+                    else:
+                        cur_gripper = q_current[6] if len(q_current) > 6 else 0.0
                     t = np.clip(cur_gripper + delta_np[6], 0, 1)
+                    _last_gripper_t[0] = float(t)
+                    _raw_gripper_cmd = int(990 - t * (990 - 1))
+                    print(f"[VLA][gripper] baseline_mode={'track' if gripper_baseline_from_track else 'q_current'} "
+                          f"cur={cur_gripper:.3f} act_delta={delta_np[6]:.4f} -> t={t:.3f} raw={_raw_gripper_cmd}")
+                    if gripper_cmd_cb is not None:
+                        try:
+                            gripper_cmd_cb(float(t))
+                        except Exception:
+                            pass
                     import threading as _threading
                     _threading.Thread(
                         target=direct_robot._datc_gripper.set_position,
-                        args=(int(990 - t * (990 - 1)),), daemon=True
+                        args=(_raw_gripper_cmd,), daemon=True
                     ).start()
             except Exception as _e:
                 print(f"[VLA] servoL 오류: {_e}")
             obs = direct_robot.get_observations(full=False)
+            if gripper_baseline_from_track:
+                obs["gripper_position"] = np.array([_last_gripper_t[0]], dtype=np.float32)
         else:
             action_np = q_current + delta_np
 
@@ -701,6 +700,10 @@ def run_inference(
             if direct_robot is not None:
                 direct_robot.command_joint_state(action_np, current_joints=q_current[:6])
                 obs = direct_robot.get_observations(full=False)
+                if gripper_baseline_from_track:
+                    if len(action_np) > 6:
+                        _last_gripper_t[0] = float(np.clip(action_np[6], 0, 1))
+                    obs["gripper_position"] = np.array([_last_gripper_t[0]], dtype=np.float32)
             else:
                 obs = env.step(action_np)
 
@@ -714,9 +717,6 @@ def run_inference(
     _executor.shutdown(wait=False)
     if _align_buf is not None:
         _align_buf.stop()
-    if _debug_video_writer is not None:
-        _debug_video_writer.release()
-        print(f"[VLA] 손목 카메라 디버그 영상 저장 완료: {_debug_video_path}")
     print("[VLA] Inference stopped.")
     return _insertion_ready
 
