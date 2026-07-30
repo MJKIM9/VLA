@@ -125,6 +125,8 @@ def cleanup():
 
     for server in active_servers:
         try:
+            if hasattr(server, "stop"):  # ZMQServerRobot: RTDE 연결을 쥔 서빙 루프 종료 신호
+                server.stop()
             if hasattr(server, "close"):
                 server.close()
         except Exception as e:
@@ -446,6 +448,7 @@ def main():
 
     # VLA 정책은 버튼 클릭 시 lazy-load (CUDA init 전에 fork하면 segfault 발생)
     vla_demo_fn = None
+    vla_demo_entry_fn = None
     set_checkpoint_fn = None
     _vla_policy = [None]  # lazy-load용 컨테이너
 
@@ -837,6 +840,189 @@ def main():
         _rec_poll_thread = threading.Thread(target=_vla_recorder_poll_loop, daemon=True)
         _rec_poll_thread.start()
 
+        def _euler_zyx_deg_to_rot_vec(rx_deg, ry_deg, rz_deg):
+            """ZYX Euler 각도(degree) → UR rotation vector(radian) 변환."""
+            rx = _np.deg2rad(rx_deg)
+            ry = _np.deg2rad(ry_deg)
+            rz = _np.deg2rad(rz_deg)
+            Rx = _np.array([[1, 0, 0], [0, _np.cos(rx), -_np.sin(rx)], [0, _np.sin(rx), _np.cos(rx)]])
+            Ry = _np.array([[_np.cos(ry), 0, _np.sin(ry)], [0, 1, 0], [-_np.sin(ry), 0, _np.cos(ry)]])
+            Rz = _np.array([[_np.cos(rz), -_np.sin(rz), 0], [_np.sin(rz), _np.cos(rz), 0], [0, 0, 1]])
+            R = Rz @ Ry @ Rx
+            angle = _np.arccos(_np.clip((_np.trace(R) - 1) / 2, -1.0, 1.0))
+            if abs(angle) < 1e-10:
+                return [0.0, 0.0, 0.0]
+            axis = _np.array([R[2,1]-R[1,2], R[0,2]-R[2,0], R[1,0]-R[0,1]]) / (2 * _np.sin(angle))
+            return (axis * angle).tolist()
+
+        def move_cs(cs_pose, label="", speed=0.2, accel=1.0):
+            """카르테시안 직선 이동. cs_pose = [x, y, z, rx_deg, ry_deg, rz_deg]"""
+            if _vla_stop.is_set():
+                return False
+            print(f"[Hybrid] {label}")
+            rot_vec = _euler_zyx_deg_to_rot_vec(cs_pose[3], cs_pose[4], cs_pose[5])
+            pose_rad = list(cs_pose[:3]) + rot_vec
+            print(f"[Hybrid]   moveL 목표: {[round(v,4) for v in pose_rad]}")
+
+            # 매 이동 전 RTDE 스크립트 완전 재시작
+            # (이전 moveL/servoJ 잔류 상태가 다음 moveL을 막는 것 방지)
+            try:
+                left_robot.robot.reuploadScript()
+            except Exception as e:
+                print(f"[Hybrid] reuploadScript 실패: {e}")
+            for _ in range(30):  # 스크립트 실행 확인 (최대 3초)
+                try:
+                    if left_robot.robot.isProgramRunning():
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.1)
+            time.sleep(0.2)  # 스크립트 초기화 완료 대기
+
+            # STOP watchdog: 20ms 간격으로 감시, 감지 시 즉시 stopL
+            _wd_stop = threading.Event()
+            def _watchdog():
+                while not _wd_stop.wait(timeout=0.02):
+                    if _vla_stop.is_set():
+                        try:
+                            left_robot.robot.stopL(2.0)
+                        except Exception:
+                            pass
+                        return
+            threading.Thread(target=_watchdog, daemon=True).start()
+
+            try:
+                left_robot.robot.moveL(pose_rad, speed, accel)  # sync
+                return not _vla_stop.is_set()
+            except Exception as e:
+                print(f"[Hybrid] moveL 실패: {e}")
+                return False
+            finally:
+                _wd_stop.set()
+
+        def set_gripper(value, label="", wait=1.0):
+            """그리퍼 직접 제어. value = raw position (0=닫힘, 1000=열림)."""
+            print(f"[Hybrid] {label}")
+            _rec_note_gripper_raw(value)  # 녹화용: 실제로 보낸 명령값 기록 (성공 여부와 무관히 의도값 기준)
+            if gripper is None:
+                print("[Hybrid] gripper 없음 — 건너뜀")
+                return
+            try:
+                gripper.set_position(int(value))
+            except Exception as e:
+                print(f"[Hybrid] gripper 제어 실패: {e}")
+            if wait > 0:
+                time.sleep(wait)
+
+        def move_z_fixed_rp(z_target, label="", speed=0.025, accel=0.15, tcp_frame=False):
+            """z를 이동. tcp_frame=True이면 TCP z축 방향으로 이동 (base_z가 z_target에 도달하도록)."""
+            if _vla_stop.is_set():
+                return False
+            try:
+                cur = left_robot.r_inter.getActualTCPPose()
+            except Exception as e:
+                print(f"[Hybrid] TCP 읽기 실패: {e}")
+                return False
+            # 현재 회전행렬 계산
+            rv = _np.array(cur[3:6])
+            angle = _np.linalg.norm(rv)
+            if angle < 1e-10:
+                R = _np.eye(3)
+            else:
+                ax = rv / angle
+                K = _np.array([[0, -ax[2], ax[1]], [ax[2], 0, -ax[0]], [-ax[1], ax[0], 0]])
+                R = _np.eye(3) + _np.sin(angle) * K + (1 - _np.cos(angle)) * (K @ K)
+
+            if tcp_frame:
+                # TCP z축 방향으로 base_z가 z_target에 도달하도록 이동
+                tcp_z = R[:, 2]  # TCP z축 (base 프레임)
+                dz_base = z_target - cur[2]
+                if abs(tcp_z[2]) < 0.1:
+                    print("[Hybrid] TCP z축이 수평에 가까워 tcp_frame 이동 불가 — base frame으로 대체")
+                    tcp_frame = False
+                else:
+                    scale = dz_base / tcp_z[2]
+                    new_xyz = _np.array(cur[:3]) + tcp_z * scale
+                    target_pose = list(new_xyz) + list(cur[3:6])
+            if not tcp_frame:
+                yaw = _np.arctan2(R[1, 0], R[0, 0])
+                roll_r  = _np.deg2rad(-179.99)
+                pitch_r = _np.deg2rad(0.0)
+                cr, sr = _np.cos(roll_r),  _np.sin(roll_r)
+                cp, sp = _np.cos(pitch_r), _np.sin(pitch_r)
+                cy, sy = _np.cos(yaw),     _np.sin(yaw)
+                Rx2 = _np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
+                Ry2 = _np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
+                Rz2 = _np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
+                R2 = Rz2 @ Ry2 @ Rx2
+                ang2 = _np.arccos(_np.clip((_np.trace(R2) - 1) / 2, -1.0, 1.0))
+                if abs(ang2) < 1e-10:
+                    rv2 = [0.0, 0.0, 0.0]
+                else:
+                    rv2 = list((ang2 / (2 * _np.sin(ang2))) * _np.array([
+                        R2[2,1] - R2[1,2], R2[0,2] - R2[2,0], R2[1,0] - R2[0,1]
+                    ]))
+                target_pose = list(cur[:2]) + [z_target] + rv2
+            print(f"[Hybrid] {label} → TCP: {[round(v,4) for v in target_pose]}")
+            try:
+                left_robot.robot.reuploadScript()
+            except Exception as e:
+                print(f"[Hybrid] reuploadScript 실패: {e}")
+            for _ in range(30):
+                try:
+                    if left_robot.robot.isProgramRunning():
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.1)
+            time.sleep(0.2)
+            _wd_stop2 = threading.Event()
+            def _watchdog2():
+                while not _wd_stop2.wait(timeout=0.02):
+                    if _vla_stop.is_set():
+                        try:
+                            left_robot.robot.stopL(2.0)
+                        except Exception:
+                            pass
+                        return
+            threading.Thread(target=_watchdog2, daemon=True).start()
+            try:
+                left_robot.robot.moveL(target_pose, speed, accel)
+                return not _vla_stop.is_set()
+            except Exception as e:
+                print(f"[Hybrid] moveL 실패: {e}")
+                return False
+            finally:
+                _wd_stop2.set()
+
+        def move_home(label="6. home 자세", speed=0.7, accel=1.4):
+            """홈 자세로 관절 공간 이동 (moveJ)."""
+            if _vla_stop.is_set():
+                return False
+            print(f"[Hybrid] {label}")
+
+            # STOP watchdog: 20ms 간격으로 감시, 감지 시 즉시 stopJ
+            _wd_stop3 = threading.Event()
+            def _watchdog3():
+                while not _wd_stop3.wait(timeout=0.02):
+                    if _vla_stop.is_set():
+                        try:
+                            left_robot.robot.stopJ(2.0)
+                        except Exception:
+                            pass
+                        return
+            threading.Thread(target=_watchdog3, daemon=True).start()
+
+            try:
+                left_robot.robot.moveJ(_HOME_RAD, speed, accel)
+                return not _vla_stop.is_set()
+            except Exception as e:
+                print(f"[Hybrid] moveJ 실패: {e}")
+                return False
+            finally:
+                _wd_stop3.set()
+
+
         def vla_demo_fn():
             if _vla_policy[0] is None:
                 print(f"[VLA] 정책 로딩 중... (device={_vla_device})")
@@ -867,188 +1053,6 @@ def main():
                 print(f"[Hybrid] 현재 TCP: {[round(v,4) for v in cur]}")
             except Exception as e:
                 print(f"[Hybrid] TCP 읽기 실패: {e}")
-
-            def _euler_zyx_deg_to_rot_vec(rx_deg, ry_deg, rz_deg):
-                """ZYX Euler 각도(degree) → UR rotation vector(radian) 변환."""
-                rx = _np.deg2rad(rx_deg)
-                ry = _np.deg2rad(ry_deg)
-                rz = _np.deg2rad(rz_deg)
-                Rx = _np.array([[1, 0, 0], [0, _np.cos(rx), -_np.sin(rx)], [0, _np.sin(rx), _np.cos(rx)]])
-                Ry = _np.array([[_np.cos(ry), 0, _np.sin(ry)], [0, 1, 0], [-_np.sin(ry), 0, _np.cos(ry)]])
-                Rz = _np.array([[_np.cos(rz), -_np.sin(rz), 0], [_np.sin(rz), _np.cos(rz), 0], [0, 0, 1]])
-                R = Rz @ Ry @ Rx
-                angle = _np.arccos(_np.clip((_np.trace(R) - 1) / 2, -1.0, 1.0))
-                if abs(angle) < 1e-10:
-                    return [0.0, 0.0, 0.0]
-                axis = _np.array([R[2,1]-R[1,2], R[0,2]-R[2,0], R[1,0]-R[0,1]]) / (2 * _np.sin(angle))
-                return (axis * angle).tolist()
-
-            def move_cs(cs_pose, label="", speed=0.2, accel=1.0):
-                """카르테시안 직선 이동. cs_pose = [x, y, z, rx_deg, ry_deg, rz_deg]"""
-                if _vla_stop.is_set():
-                    return False
-                print(f"[Hybrid] {label}")
-                rot_vec = _euler_zyx_deg_to_rot_vec(cs_pose[3], cs_pose[4], cs_pose[5])
-                pose_rad = list(cs_pose[:3]) + rot_vec
-                print(f"[Hybrid]   moveL 목표: {[round(v,4) for v in pose_rad]}")
-
-                # 매 이동 전 RTDE 스크립트 완전 재시작
-                # (이전 moveL/servoJ 잔류 상태가 다음 moveL을 막는 것 방지)
-                try:
-                    left_robot.robot.reuploadScript()
-                except Exception as e:
-                    print(f"[Hybrid] reuploadScript 실패: {e}")
-                for _ in range(30):  # 스크립트 실행 확인 (최대 3초)
-                    try:
-                        if left_robot.robot.isProgramRunning():
-                            break
-                    except Exception:
-                        pass
-                    time.sleep(0.1)
-                time.sleep(0.2)  # 스크립트 초기화 완료 대기
-
-                # STOP watchdog: 20ms 간격으로 감시, 감지 시 즉시 stopL
-                _wd_stop = threading.Event()
-                def _watchdog():
-                    while not _wd_stop.wait(timeout=0.02):
-                        if _vla_stop.is_set():
-                            try:
-                                left_robot.robot.stopL(2.0)
-                            except Exception:
-                                pass
-                            return
-                threading.Thread(target=_watchdog, daemon=True).start()
-
-                try:
-                    left_robot.robot.moveL(pose_rad, speed, accel)  # sync
-                    return not _vla_stop.is_set()
-                except Exception as e:
-                    print(f"[Hybrid] moveL 실패: {e}")
-                    return False
-                finally:
-                    _wd_stop.set()
-
-            def set_gripper(value, label="", wait=1.0):
-                """그리퍼 직접 제어. value = raw position (0=닫힘, 1000=열림)."""
-                print(f"[Hybrid] {label}")
-                _rec_note_gripper_raw(value)  # 녹화용: 실제로 보낸 명령값 기록 (성공 여부와 무관히 의도값 기준)
-                if gripper is None:
-                    print("[Hybrid] gripper 없음 — 건너뜀")
-                    return
-                try:
-                    gripper.set_position(int(value))
-                except Exception as e:
-                    print(f"[Hybrid] gripper 제어 실패: {e}")
-                if wait > 0:
-                    time.sleep(wait)
-
-            def move_z_fixed_rp(z_target, label="", speed=0.025, accel=0.15, tcp_frame=False):
-                """z를 이동. tcp_frame=True이면 TCP z축 방향으로 이동 (base_z가 z_target에 도달하도록)."""
-                if _vla_stop.is_set():
-                    return False
-                try:
-                    cur = left_robot.r_inter.getActualTCPPose()
-                except Exception as e:
-                    print(f"[Hybrid] TCP 읽기 실패: {e}")
-                    return False
-                # 현재 회전행렬 계산
-                rv = _np.array(cur[3:6])
-                angle = _np.linalg.norm(rv)
-                if angle < 1e-10:
-                    R = _np.eye(3)
-                else:
-                    ax = rv / angle
-                    K = _np.array([[0, -ax[2], ax[1]], [ax[2], 0, -ax[0]], [-ax[1], ax[0], 0]])
-                    R = _np.eye(3) + _np.sin(angle) * K + (1 - _np.cos(angle)) * (K @ K)
-
-                if tcp_frame:
-                    # TCP z축 방향으로 base_z가 z_target에 도달하도록 이동
-                    tcp_z = R[:, 2]  # TCP z축 (base 프레임)
-                    dz_base = z_target - cur[2]
-                    if abs(tcp_z[2]) < 0.1:
-                        print("[Hybrid] TCP z축이 수평에 가까워 tcp_frame 이동 불가 — base frame으로 대체")
-                        tcp_frame = False
-                    else:
-                        scale = dz_base / tcp_z[2]
-                        new_xyz = _np.array(cur[:3]) + tcp_z * scale
-                        target_pose = list(new_xyz) + list(cur[3:6])
-                if not tcp_frame:
-                    yaw = _np.arctan2(R[1, 0], R[0, 0])
-                    roll_r  = _np.deg2rad(-179.99)
-                    pitch_r = _np.deg2rad(0.0)
-                    cr, sr = _np.cos(roll_r),  _np.sin(roll_r)
-                    cp, sp = _np.cos(pitch_r), _np.sin(pitch_r)
-                    cy, sy = _np.cos(yaw),     _np.sin(yaw)
-                    Rx2 = _np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
-                    Ry2 = _np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
-                    Rz2 = _np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
-                    R2 = Rz2 @ Ry2 @ Rx2
-                    ang2 = _np.arccos(_np.clip((_np.trace(R2) - 1) / 2, -1.0, 1.0))
-                    if abs(ang2) < 1e-10:
-                        rv2 = [0.0, 0.0, 0.0]
-                    else:
-                        rv2 = list((ang2 / (2 * _np.sin(ang2))) * _np.array([
-                            R2[2,1] - R2[1,2], R2[0,2] - R2[2,0], R2[1,0] - R2[0,1]
-                        ]))
-                    target_pose = list(cur[:2]) + [z_target] + rv2
-                print(f"[Hybrid] {label} → TCP: {[round(v,4) for v in target_pose]}")
-                try:
-                    left_robot.robot.reuploadScript()
-                except Exception as e:
-                    print(f"[Hybrid] reuploadScript 실패: {e}")
-                for _ in range(30):
-                    try:
-                        if left_robot.robot.isProgramRunning():
-                            break
-                    except Exception:
-                        pass
-                    time.sleep(0.1)
-                time.sleep(0.2)
-                _wd_stop2 = threading.Event()
-                def _watchdog2():
-                    while not _wd_stop2.wait(timeout=0.02):
-                        if _vla_stop.is_set():
-                            try:
-                                left_robot.robot.stopL(2.0)
-                            except Exception:
-                                pass
-                            return
-                threading.Thread(target=_watchdog2, daemon=True).start()
-                try:
-                    left_robot.robot.moveL(target_pose, speed, accel)
-                    return not _vla_stop.is_set()
-                except Exception as e:
-                    print(f"[Hybrid] moveL 실패: {e}")
-                    return False
-                finally:
-                    _wd_stop2.set()
-
-            def move_home(label="6. home 자세", speed=0.7, accel=1.4):
-                """홈 자세로 관절 공간 이동 (moveJ)."""
-                if _vla_stop.is_set():
-                    return False
-                print(f"[Hybrid] {label}")
-
-                # STOP watchdog: 20ms 간격으로 감시, 감지 시 즉시 stopJ
-                _wd_stop3 = threading.Event()
-                def _watchdog3():
-                    while not _wd_stop3.wait(timeout=0.02):
-                        if _vla_stop.is_set():
-                            try:
-                                left_robot.robot.stopJ(2.0)
-                            except Exception:
-                                pass
-                            return
-                threading.Thread(target=_watchdog3, daemon=True).start()
-
-                try:
-                    left_robot.robot.moveJ(_HOME_RAD, speed, accel)
-                    return not _vla_stop.is_set()
-                except Exception as e:
-                    print(f"[Hybrid] moveJ 실패: {e}")
-                    return False
-                finally:
-                    _wd_stop3.set()
 
             # ── 0단계: 체결 이동 (home 경유 전, Finger Change 토글로 on/off) ──
             if vla_cfg.get("finger_change", True):
@@ -1155,6 +1159,287 @@ def main():
                     return
                 move_home("5-4. home 복귀")
 
+        # ════════════════════════════════════════════════════════════════════
+        # [신규/실험적] 멀티 pivot 버전 — v19/v21용 vla_demo_fn과는 완전히 별개.
+        # 기존 단일 pivot 실행(위 vla_demo_fn, v19/v21)에는 전혀 영향을 주지 않는다.
+        # 케이블은 한 번만 파지하고, home에서 검출한 pivot 개수만큼 이동+정렬+삽입을 반복한다.
+        # 아래는 뼈대만 짜둔 것 — pivot별 실제 정렬/삽입/복귀 로직은 추후 직접 작성.
+        # ════════════════════════════════════════════════════════════════════
+
+        def _detect_pivots_home(img_bgr):
+            """home에서 케이블 파지 *후* 촬영한 프레임에서 노란 pivot들을 개별 검출.
+            파지 전에 찍으므로 케이블에 가려질 일이 없어 blob 병합 로직은 불필요.
+            반환: [(cx, cy), ...] — 픽셀 y좌표 기준 위→아래 정렬."""
+            import cv2 as _cv2_mp
+            hsv = _cv2_mp.cvtColor(img_bgr, _cv2_mp.COLOR_BGR2HSV)
+            mask = _cv2_mp.inRange(hsv, _np.array([10, 150, 120]), _np.array([26, 255, 255]))
+            mask = _cv2_mp.erode(mask, None, iterations=2)
+            mask = _cv2_mp.dilate(mask, None, iterations=2)
+            n_labels, _labels, stats, centroids = _cv2_mp.connectedComponentsWithStats(mask, connectivity=8)
+            blobs = []
+            for i in range(1, n_labels):  # 0번 라벨은 배경
+                area = stats[i, _cv2_mp.CC_STAT_AREA]
+                if area < _MIN_AREA_COLOR:
+                    continue
+                cx, cy = centroids[i]
+                blobs.append((float(cx), float(cy)))
+            blobs.sort(key=lambda p: p[1])  # 위(작은 y) → 아래(큰 y)
+            return blobs
+
+        _PIVOT_HOME_DEPTH   = 0.6    # home에서 카메라~케이블(작업면) 거리 (m, 실측)
+        _PIVOT_HOVER_HEIGHT = 0.10   # pivot 위 얼마나 띄워서 접근할지 (m, 참고용)
+        _PIVOT_HOVER_Z      = 0.30   # 테이블 위 10cm 지점의 카테시안 z 절대값(실측)
+
+        def _pivot_pixel_to_target(cx, cy, img_w, img_h, home_tcp, wrist_cam):
+            """픽셀 좌표 → 대략적인 로봇 베이스 좌표계 hover 목표 pose(근사치).
+            home 자세는 항상 고정된 관절각이라 TCP 회전이 매번 동일하므로,
+            회전 보정 없이 기존 compute_alignment_xyz/서보잉과 같은 축 부호 규칙만
+            그대로 재사용해도 충분히 근사가 된다. 이후 미세 정렬은 기존 ACT/서보잉이 담당.
+
+            반환값은 move_cs()가 기대하는 형식 [x, y, z, rx_deg, ry_deg, rz_deg](ZYX 오일러, 도)이다.
+            home_tcp(getActualTCPPose())는 회전을 라디안 축각(rotvec)으로 주기 때문에
+            단위/표현 방식이 달라 그대로 쓰면 안 되고 RPY(도)로 변환해야 한다."""
+            from gello.robots.ur import _rotvec_to_rpy
+            dx_cam = (cx - img_w / 2) * _PIVOT_HOME_DEPTH / wrist_cam.fx
+            dy_cam = (cy - img_h / 2) * _PIVOT_HOME_DEPTH / wrist_cam.fy
+            # 실측 2개 지점(서로 다른 pixel 위치)으로 역산한 카메라->base 일반 선형변환.
+            # 순수 회전+배율 모델은 행렬식이 항상 양수라 반전(mirror) 성분을 표현할 수
+            # 없는데, 실측 데이터로 풀어보니 필요한 변환의 행렬식이 음수(반전 포함)라서
+            # 회전+배율 모델 자체가 맞지 않았다. 대신 2x2 일반 선형변환을 직접 사용한다.
+            # TODO: 세 번째 이상의 지점으로 추가 검증 필요 (현재는 2개 점으로 정확히
+            # 맞춘 값이라 과적합 위험이 있음).
+            _CAL_M = _np.array([
+                [-0.84911901,  0.02548869],
+                [-0.09355511,  0.91111967],
+            ])
+            dx_base, dy_base = _CAL_M @ _np.array([dx_cam, dy_cam])
+            rpy_rad = _rotvec_to_rpy(_np.array(home_tcp[3:6], dtype=_np.float64))
+            rpy_deg = _np.rad2deg(rpy_rad)
+            target = [
+                float(home_tcp[0] + dx_base),
+                float(home_tcp[1] + dy_base),
+                _PIVOT_HOVER_Z,
+                float(rpy_deg[0]), float(rpy_deg[1]), float(rpy_deg[2]),
+            ]
+            print(f"[VLA-MP][debug] pixel=({cx:.1f},{cy:.1f}) img=({img_w}x{img_h}) "
+                  f"fx={wrist_cam.fx:.2f} fy={wrist_cam.fy:.2f} depth={_PIVOT_HOME_DEPTH}")
+            print(f"[VLA-MP][debug] dx_cam={dx_cam:+.4f} dy_cam={dy_cam:+.4f} "
+                  f"-> dx_base={dx_base:+.4f} dy_base={dy_base:+.4f}")
+            print(f"[VLA-MP][debug] home_tcp xy=({home_tcp[0]:.4f},{home_tcp[1]:.4f}) "
+                  f"home_rpy_deg=({rpy_deg[0]:.2f},{rpy_deg[1]:.2f},{rpy_deg[2]:.2f}) "
+                  f"-> target xy=({target[0]:.4f},{target[1]:.4f})")
+            return target
+
+        def vla_demo_multi_pivot_fn():
+            """[신규/실험적] 여러 pivot을 순차적으로 처리. 케이블은 1회만 파지."""
+            if _vla_policy[0] is None:
+                print(f"[VLA-MP] 정책 로딩 중... (device={_vla_device})")
+                _vla_policy[0], _vla_stats[0] = load_policy(_vla_checkpoint[0], _vla_device)
+                print("[VLA-MP] 정책 로딩 완료.")
+            else:
+                print(f"[VLA-MP] 이미 로드된 정책 재사용: {_vla_checkpoint[0]}")
+
+            _vla_stop.clear()
+            teleop_event.clear()
+            time.sleep(0.3)
+            try:
+                left_robot.robot.servoStop(10.0)
+            except Exception:
+                pass
+            time.sleep(0.1)
+            try:
+                left_robot.robot.reuploadScript()
+                print("[VLA-MP] RTDE 스크립트 재시작 완료")
+            except Exception as e:
+                print(f"[VLA-MP] reuploadScript 실패: {e}")
+            time.sleep(0.3)
+
+            # ── 0단계: 체결 이동 (home 경유 전, Finger Change 토글) ──
+            if vla_cfg.get("finger_change", True):
+                if not move_cs(_PRE_FASTEN_CS, "0-1. 체결 전", speed=0.2, accel=0.40):
+                    return
+                if not move_cs(_FASTEN_CS,     "0-2. 체결 자세", speed=0.05, accel=0.1):
+                    return
+                if not move_cs(_POST_FASTEN_CS, "0-3. 체결 후", speed=0.05, accel=0.1):
+                    return
+
+            # ── 1단계: home 도착 직후 — 케이블 파지 *전* pivot 검출 및 좌표 매핑 ──
+            # (파지 전이라 케이블에 가려질 pivot이 없음)
+            if not move_home("1. home 경유"):
+                return
+            wrist_cam = cameras.get("wrist")
+            if wrist_cam is None:
+                print("[VLA-MP] 손목 카메라 없음 — pivot 검출 불가, 종료")
+                return
+            import cv2 as _cv2_mp2
+            img_rgb, _ = wrist_cam.read()
+            img_bgr = _cv2_mp2.cvtColor(img_rgb, _cv2_mp2.COLOR_RGB2BGR)
+            pivots_px = _detect_pivots_home(img_bgr)
+            print(f"[VLA-MP] pivot 검출: {len(pivots_px)}개 (위→아래 순)")
+            if not pivots_px:
+                print("[VLA-MP] pivot이 검출되지 않아 종료")
+                return
+
+            home_tcp = list(left_robot.r_inter.getActualTCPPose())
+            img_h, img_w = img_bgr.shape[:2]
+            pivot_targets = [
+                _pivot_pixel_to_target(cx, cy, img_w, img_h, home_tcp, wrist_cam)
+                for cx, cy in pivots_px
+            ]
+
+            # ── 2단계: 사전 티칭 — 케이블 파지 (1회) ──
+            set_gripper(_GRIPPER_OPEN, "2. gripper open", wait=0)
+            if not move_cs(_PRE_GRASP_CS, "3. 케이블 파지 전 자세", speed=0.3, accel=0.6):
+                return
+            if not move_cs(_GRASP_CS,     "4. 케이블 파지 자세", speed=0.3, accel=0.6):
+                return
+            set_gripper(_GRIPPER_CLOSE, "5. gripper close")
+            time.sleep(0.5)
+            if not move_cs(_POST_GRASP_CS, "6. 케이블 파지 후 자세", speed=0.3, accel=0.6):
+                return
+            if not move_home("7. home"):
+                return
+
+            # ── 3단계: pivot별 반복 ──
+            # 1. 정렬 2. 삽입: 기존 vla_demo_fn(v19/v21)의 2~3단계(run_inference 서보잉 +
+            #    move_z_fixed_rp 삽입)와 동일한 흐름을 그대로 재사용.
+            # 3. 그리퍼: 완전 개방이 아닌 3%만 개방(포지션 제어).
+            # 4. 후퇴: pivot이 위치한 반대방향으로 y 5cm 후퇴 → z 5cm 후퇴.
+            from gello.robots.ur import _rotvec_to_rpy
+            for i, target in enumerate(pivot_targets, start=1):
+                if _vla_stop.is_set():
+                    return
+                print(f"[VLA-MP] pivot {i}/{len(pivot_targets)} hover 목표: "
+                      f"{[round(v, 4) for v in target]}")
+                if not move_cs(target, f"pivot {i} 위로 이동(hover, 근사)", speed=0.05, accel=0.1):
+                    return
+
+                # ── 1. 정렬 (ACT/서보잉, v19/v21과 동일한 run_inference 호출) ──
+                _eff_gain = vla_cfg.get("admittance_gain", 0.0) if _admittance_active[0] else 0.0
+                _z_approach = vla_cfg.get("z_approach")
+                _z_floor    = vla_cfg.get("z_floor")
+                _z_insert   = vla_cfg.get("z_insert", 0.24)
+                _align_thr  = vla_cfg.get("align_insert_threshold", 0.002)
+                _gripper_baseline_from_track = "v21" in str(_vla_checkpoint[0]).lower()
+                _rec_poll_pause.set()
+                try:
+                    insertion_ready = run_inference(
+                        env=env,
+                        cameras=cameras,
+                        policy=_vla_policy[0],
+                        stats=_vla_stats[0] or {},
+                        device=_vla_device,
+                        fps=cfg.get("hz", 30),
+                        chunk_size=vla_cfg.get("chunk_size", 20),
+                        stop_event=_vla_stop,
+                        speed_scale=vla_cfg.get("speed_scale", 1.0),
+                        delta_scale=vla_cfg.get("delta_scale", 1.0),
+                        fix_orientation=vla_cfg.get("fix_orientation", False),
+                        direct_robot=left_robot,
+                        z_approach_threshold=_z_approach,
+                        z_floor=_z_floor,
+                        use_z_freeze=vla_cfg.get("use_z_freeze", False),
+                        align_insert_threshold=_align_thr,
+                        cartesian_action=_cartesian_action,
+                        control_gripper=vla_cfg.get("control_gripper", True),
+                        admittance_gain=_eff_gain,
+                        admittance_deadband=vla_cfg.get("admittance_deadband", 3.0),
+                        admittance_spring_k=vla_cfg.get("admittance_spring_k", 0.0),
+                        admittance_damping_b=vla_cfg.get("admittance_damping_b", 0.0),
+                        record_cb=_vla_record_step,
+                        gripper_cmd_cb=lambda t: _rec_gripper_t.__setitem__(0, t),
+                        gripper_baseline_from_track=_gripper_baseline_from_track,
+                        yellow_roi_scale=0.5,  # 여러 pivot 노란색이 한 프레임에 겹쳐 잡히는 것 방지
+                    )
+                finally:
+                    _rec_poll_pause.clear()
+
+                if not insertion_ready:
+                    if _vla_stop.is_set():
+                        print(f"[VLA-MP] pivot {i} 정렬 중 STOP 감지 — 전체 중단")
+                        return
+                    print(f"[VLA-MP] pivot {i} 삽입 조건 미충족 — 이 pivot 건너뜀")
+                    continue
+
+                # ── 2. 삽입 ──
+                print(f"[VLA-MP] pivot {i} 삽입 시퀀스 시작")
+                _vla_stop.clear()
+                try:
+                    left_robot.robot.servoStop(10.0)
+                except Exception:
+                    pass
+                time.sleep(0.1)
+                if not move_z_fixed_rp(_z_insert, f"pivot {i} 삽입 z={_z_insert}", tcp_frame=True):
+                    continue
+
+                # ── 3. 그리퍼 3%만 개방(포지션 제어, 완전 개방 아님) ──
+                set_gripper(_GRIPPER_OPEN_3PCT, f"pivot {i} 그리퍼 3% 개방")
+
+                # 맨 마지막 pivot이면 후퇴 직전에 케이블을 완전히 놓아준다.
+                if i == len(pivot_targets):
+                    set_gripper(_GRIPPER_OPEN, f"pivot {i}(마지막) 그리퍼 완전 개방")
+
+                # ── 4. 후퇴: 다음 pivot이 있으면 x는 그 pivot의 hover x로, y는 그
+                #    pivot hover y값의 3cm 전까지 이동. 없으면(마지막 pivot) 기존처럼
+                #    x는 유지, pivot 반대방향 y 7cm 후퇴 → z 5cm ──
+                cur = list(left_robot.r_inter.getActualTCPPose())
+                rpy_deg = _np.rad2deg(_rotvec_to_rpy(_np.array(cur[3:6], dtype=_np.float64)))
+                if i < len(pivot_targets):
+                    next_target = pivot_targets[i]  # 0-indexed: i번째 = 다음(i+1번) pivot
+                    x_new = next_target[0]
+                    next_y = next_target[1]
+                    _dir = 1.0 if next_y > cur[1] else -1.0
+                    y_new = next_y - _dir * 0.06
+                    _retreat_label = f"pivot {i} 후퇴(다음 pivot 방향, y는 6cm 전까지)"
+                else:
+                    x_new = cur[0]
+                    pivot_y_offset = target[1] - home_tcp[1]
+                    retreat_sign = -1.0 if pivot_y_offset >= 0 else 1.0
+                    y_new = cur[1] + retreat_sign * 0.07
+                    _retreat_label = f"pivot {i}(마지막) y 후퇴 7cm"
+                y_retreat_target = [
+                    x_new,
+                    y_new,
+                    cur[2],
+                    float(rpy_deg[0]), float(rpy_deg[1]), float(rpy_deg[2]),
+                ]
+                if not move_cs(y_retreat_target, _retreat_label, speed=0.03, accel=0.05):
+                    continue
+                cur_z = left_robot.r_inter.getActualTCPPose()[2]
+                move_z_fixed_rp(cur_z + 0.05, f"pivot {i} z 후퇴 5cm", speed=0.03, accel=0.05, tcp_frame=True)
+
+            # ── 4단계: 전체 완료 후 정리 (1회) ──
+            print("[VLA-MP] 모든 pivot 처리 완료")
+            set_gripper(_GRIPPER_CLOSE, "그리퍼 close")
+            move_home("home 복귀")
+            if vla_cfg.get("finger_change", True):
+                if not move_cs(_POST_FASTEN_CS, "체결 후", speed=0.3, accel=0.6):
+                    return
+                if not move_cs(_FASTEN_CS,      "체결 자세", speed=0.05, accel=0.1):
+                    return
+                if not move_cs(_PRE_FASTEN_CS,  "체결 전", speed=0.1, accel=0.2):
+                    return
+                move_home("home 복귀")
+
+        # ── Multi Pivot 체크박스 분기 ──────────────────────────────────────
+        # 체크 시: 항상 v19 체크포인트를 강제로 사용(현재 UI에서 선택된 체크포인트와
+        # 무관하게 전환)하고 vla_demo_multi_pivot_fn() 실행.
+        # 체크 해제 시: 기존 vla_demo_fn(v19/v21, 단일 pivot) 그대로 실행.
+        _MULTI_PIVOT_CHECKPOINT = str(
+            Path("~/checkpoints/ur10_act_v19/checkpoints/last/pretrained_model").expanduser()
+        )
+
+        def vla_demo_entry_fn():
+            if vla_cfg.get("multi_pivot", False):
+                if _vla_checkpoint[0] != _MULTI_PIVOT_CHECKPOINT:
+                    print(f"[VLA-MP] Multi Pivot 모드 — v19 체크포인트로 강제 전환: {_MULTI_PIVOT_CHECKPOINT}")
+                    _vla_checkpoint[0] = _MULTI_PIVOT_CHECKPOINT
+                    _vla_policy[0] = None
+                    _vla_stats[0] = None
+                vla_demo_multi_pivot_fn()
+            else:
+                vla_demo_fn()
+
 
     estop_fn = getattr(left_robot, "stop", None)
 
@@ -1189,6 +1474,7 @@ def main():
 
     _GRIPPER_OPEN  = 500   # gripper open (0=닫힘, 1000=열림)
     _GRIPPER_CLOSE = 0     # gripper close
+    _GRIPPER_OPEN_3PCT = 30  # 멀티 pivot 삽입 후: 완전 개방이 아닌 3%만 개방(포지션 제어)
 
     _admittance_active = [False]
 
@@ -1298,24 +1584,12 @@ def main():
         if _ckpt_path.name == "pretrained_model" and _ckpt_path.parent.parent.name == "checkpoints":
             _current_checkpoint_label = f"{_ckpt_path.parent.parent.parent.name}/{_ckpt_path.parent.name}"
 
-    def set_unwrap_rotvec_fn(enabled: bool):
-        """UI 토글: v19(RPY)/v20(축각+unwrap) 실행 모드 전환. 텔레옵/VLA 실행 중엔 막는다."""
-        if teleop_event.is_set() or not _vla_stop.is_set():
-            print("[Orientation] 텔레옵/VLA 실행 중에는 orientation 모드를 바꿀 수 없습니다.")
-            return
-        left_robot.set_unwrap_rotvec(enabled)
-        try:
-            _update_yaml_scalar(args.left_config_path, "unwrap_rotvec", enabled)
-        except Exception as e:
-            print(f"[Orientation] yaml 저장 실패: {e}")
-        print(f"[Orientation] unwrap_rotvec={enabled} ({'v20 축각' if enabled else 'v19 RPY'}) 로 전환")
-
     panel = ControlPanel(
         teleop_event=teleop_event,
         gripper=gripper,
         recorder=recorder,
         recorder_lock=_rec_lock,
-        vla_demo_fn=vla_demo_fn,
+        vla_demo_fn=vla_demo_entry_fn if vla_demo_fn else None,
         gello_robot=gello_robot,
         gc_xml_path=gc_cfg.get("xml_path"),
         gc_torque_to_pwm=gc_torque_to_pwm,
@@ -1334,8 +1608,6 @@ def main():
         current_dataset=_current_dataset_name,
         set_checkpoint_fn=set_checkpoint_fn,
         set_dataset_fn=set_dataset_fn,
-        set_unwrap_rotvec_fn=set_unwrap_rotvec_fn,
-        current_unwrap_rotvec=bool(left_robot_cfg.get("unwrap_rotvec", False)),
         vla_params=vla_cfg,
         set_vla_params_fn=set_vla_params_fn,
         start_act_training_fn=start_act_training_fn,
@@ -1350,6 +1622,13 @@ def main():
     finally:
         if recorder is not None:
             recorder.close()
+        # UI 창을 닫아 panel.run()(mainloop)이 정상 반환된 경우에도, ZMQServerRobot
+        # serve 스레드(non-daemon, ur10e RTDE 연결 보유)가 stop() 신호를 받지 못하면
+        # 프로세스가 종료되지 않고 계속 떠 있는다. cleanup()으로 명시적으로 정리하고
+        # 곧바로 프로세스를 종료한다.
+        cleanup()
+        import os as _os_exit
+        _os_exit._exit(0)
 
 
 if __name__ == "__main__":

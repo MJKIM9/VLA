@@ -149,17 +149,28 @@ def _fix_tcp_orientation(tcp_pose_6d):
     return list(tcp_pose_6d[:3]) + list(rv2)
 
 
-def _detect_color_centroid(img_bgr, lower_hsv, upper_hsv):
+def _detect_color_centroid(img_bgr, lower_hsv, upper_hsv, roi_scale=1.0):
     """HSV 범위로 검출된 모든 픽셀의 무게중심 (u, v) 반환. 검출 실패 시 None.
-    노란 커넥터처럼 케이블에 가려 두 덩어리로 쪼개지는 경우에도 중심을 올바르게 추정한다."""
+    노란 커넥터처럼 케이블에 가려 두 덩어리로 쪼개지는 경우에도 중심을 올바르게 추정한다.
+
+    roi_scale: 1.0(기본)이면 기존 ROI(가로만 _COLOR_ROI_LEFT~_COLOR_ROI_RIGHT, 세로 제한 없음)
+    그대로. 1.0 미만이면 가로/세로 모두 이미지 중심을 기준으로 그 비율만큼 좁힌 ROI를 적용한다
+    (예: 0.5 = 중심 기준 절반 크기). 멀티 pivot 서보잉/추론 전용 — 기본값 1.0은 v19/v21과
+    완전히 동일한 기존 동작을 보존한다."""
     import cv2
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, np.array(lower_hsv), np.array(upper_hsv))
     mask = cv2.erode(mask, None, iterations=2)
     mask = cv2.dilate(mask, None, iterations=2)
     h, w = mask.shape
-    mask[:, :int(w * _COLOR_ROI_LEFT)]  = 0
-    mask[:, int(w * _COLOR_ROI_RIGHT):] = 0
+    x_left  = 0.5 - (0.5 - _COLOR_ROI_LEFT)  * roi_scale
+    x_right = 0.5 + (_COLOR_ROI_RIGHT - 0.5) * roi_scale
+    y_top   = 0.5 - 0.5 * roi_scale
+    y_bot   = 0.5 + 0.5 * roi_scale
+    mask[:, :int(w * x_left)]  = 0
+    mask[:, int(w * x_right):] = 0
+    mask[:int(h * y_top), :]  = 0
+    mask[int(h * y_bot):, :]  = 0
     pts = np.argwhere(mask > 0)  # (row, col)
     if len(pts) < _MIN_AREA_COLOR:
         return None
@@ -204,9 +215,10 @@ _ALIGN_FIXED_DEPTH = 0.30  # depth 센서 대신 사용할 고정 작업거리 (
 
 class _AlignBuffer:
     """백그라운드 스레드에서 정렬 계산을 지속 실행하고 최신 결과를 캐싱."""
-    def __init__(self, cam_buffer, wrist_cam):
+    def __init__(self, cam_buffer, wrist_cam, yellow_roi_scale=1.0):
         self._cam_buffer = cam_buffer
         self._wrist_cam = wrist_cam
+        self._yellow_roi_scale = yellow_roi_scale
         self._result = np.zeros(2, dtype=np.float32)
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -221,7 +233,7 @@ class _AlignBuffer:
                 time.sleep(0.005)
                 continue
             img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-            xy = compute_alignment_xyz(img_bgr, self._wrist_cam)[:2]
+            xy = compute_alignment_xyz(img_bgr, self._wrist_cam, self._yellow_roi_scale)[:2]
             with self._lock:
                 self._result = xy
 
@@ -233,11 +245,14 @@ class _AlignBuffer:
         self._stop.set()
 
 
-def compute_alignment_xyz(img_bgr, wrist_cam) -> np.ndarray:
+def compute_alignment_xyz(img_bgr, wrist_cam, yellow_roi_scale=1.0) -> np.ndarray:
     """손목 카메라에서 케이블(검정) tip - 노란 물체의 xy 오정렬 벡터(미터) 반환.
-    depth 센서 대신 고정 작업거리로 픽셀 → 미터 변환 (z=0)."""
+    depth 센서 대신 고정 작업거리로 픽셀 → 미터 변환 (z=0).
+
+    yellow_roi_scale: 노란색 검출 ROI 축소 비율(1.0=기존 그대로). 멀티 pivot에서 여러
+    pivot의 노란색이 한 프레임에 같이 잡혀 정렬이 혼동되는 것을 막기 위해 사용."""
     # yellow = _detect_color_centroid(img_bgr, [22, 150, 120], [32, 255, 255])  # 기존 노란색 기준
-    yellow = _detect_color_centroid(img_bgr, [10, 150, 120], [26, 255, 255])
+    yellow = _detect_color_centroid(img_bgr, [10, 150, 120], [26, 255, 255], roi_scale=yellow_roi_scale)
     cable  = _detect_cable_tip(img_bgr)
     if yellow is None or cable is None:
         return np.zeros(3, dtype=np.float32)
@@ -377,6 +392,7 @@ def run_inference(
     record_cb=None,
     gripper_cmd_cb=None,
     gripper_baseline_from_track: bool = False,
+    yellow_roi_scale: float = 1.0,
 ) -> bool:
     """Main inference loop. Runs until stop_event is set.
 
@@ -391,6 +407,9 @@ def run_inference(
                   명령을 보낼 때마다(0~1 정규화 값) 호출된다. DATC는 위치 피드백이
                   없어 obs로는 그리퍼 상태를 알 수 없으므로, 녹화 쪽에서 "실제로
                   보낸 명령"을 추적하는 용도.
+    yellow_roi_scale: 노란색 검출 ROI 축소 비율(기본 1.0=기존 그대로). 멀티 pivot에서
+                  여러 pivot의 노란색이 한 프레임에 동시에 잡혀 정렬이 혼동되는 것을
+                  막기 위해 1.0 미만 값을 넘긴다.
     record_cb: (obs, imgs) -> None. 매 스텝, 실제 이동을 적용하기 *직전*의 obs(및 그 시점
                카메라 프레임)로 호출된다. 호출부에서 recorder.is_recording 여부를 직접 체크하며,
                제어 흐름에는 관여하지 않는다(부산물 기록 전용).
@@ -452,7 +471,7 @@ def run_inference(
     _wrist_cam = cameras.get("wrist")
     _align_buf = None
     if _wrist_cam is not None and "wrist" in cam_buffers:
-        _align_buf = _AlignBuffer(cam_buffers["wrist"], _wrist_cam)
+        _align_buf = _AlignBuffer(cam_buffers["wrist"], _wrist_cam, yellow_roi_scale=yellow_roi_scale)
 
     # 서보잉 목표: 두 점을 정확히 일치(align_y=0)시키는 게 아니라,
     # 노란점이 파란(케이블)점보다 이미지 높이의 약 3%만큼 위에 오도록 정렬한다.

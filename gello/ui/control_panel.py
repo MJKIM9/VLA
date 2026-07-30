@@ -69,6 +69,7 @@ _VLA_NUMERIC_PARAMS = [
 _VLA_BOOL_PARAMS = [
     ("control_gripper", True, "control_gripper"),
     ("finger_change", True, "Finger Change"),
+    ("multi_pivot", False, "Multi Pivot"),
 ]
 # (yaml 키, 선택지, 기본값) — 드롭다운으로 노출할 문자열/다중값 파라미터
 _VLA_CHOICE_PARAMS = [
@@ -118,8 +119,6 @@ class ControlPanel:
         current_dataset: Optional[str] = None,
         set_checkpoint_fn: Optional[Callable[[str], None]] = None,
         set_dataset_fn: Optional[Callable[[str], None]] = None,
-        set_unwrap_rotvec_fn: Optional[Callable[[bool], None]] = None,
-        current_unwrap_rotvec: bool = False,
         vla_params: Optional[Dict] = None,
         set_vla_params_fn: Optional[Callable[[Dict], None]] = None,
         start_act_training_fn: Optional[Callable[[Dict], None]] = None,
@@ -144,7 +143,6 @@ class ControlPanel:
         self._admittance_on = False
         self._cameras = cameras or {}
         self._record_queue = record_queue
-        self._impedance_on = False
         self._saving = False  # 녹화 저장(record_queue 드레인) 도중 Go Home 등 로봇 명령 충돌 방지
         self._ui_queue = _queue_mod.Queue()  # 스레드→메인 UI 업데이트 큐
 
@@ -152,11 +150,9 @@ class ControlPanel:
         self._datasets_dir = datasets_dir
         self._set_checkpoint_fn = set_checkpoint_fn
         self._set_dataset_fn = set_dataset_fn
-        self._set_unwrap_rotvec_fn = set_unwrap_rotvec_fn
         self._checkpoint_map: Dict[str, str] = {}  # 라벨 → pretrained_model 경로
         self._current_checkpoint_label = current_checkpoint
         self._current_dataset = current_dataset
-        self._current_unwrap_rotvec = current_unwrap_rotvec
         self._vla_params = vla_params or {}
         self._set_vla_params_fn = set_vla_params_fn
         self._start_act_training_fn = start_act_training_fn
@@ -272,16 +268,6 @@ class ControlPanel:
         self._md_status = tk.Label(md_frame, text="", font=FONT_LABEL, bg=BG_CARD, fg="#a6e3a1", justify="left")
         self._md_status.pack(padx=8, pady=(0, 6), anchor="w")
 
-        orient_row = tk.Frame(md_frame, bg=BG_CARD)
-        orient_row.pack(fill="x", padx=8, pady=(0, 6))
-        self._unwrap_rotvec_var = tk.BooleanVar(value=bool(self._current_unwrap_rotvec))
-        tk.Checkbutton(
-            orient_row, text="unwrap_rotvec (체크=v20 축각 / 해제=v19 RPY)",
-            variable=self._unwrap_rotvec_var, font=FONT_BTN_SM,
-            bg=BG_CARD, fg=FG, selectcolor=BG_CARD, activebackground=BG_CARD,
-            command=self._toggle_unwrap_rotvec,
-        ).pack(side="left")
-
         self._refresh_checkpoints()
         self._refresh_datasets()
 
@@ -376,15 +362,6 @@ class ControlPanel:
         tk.Entry(g_row2, textvariable=self._pos_var, width=8, font=FONT_LABEL).pack(side="left", padx=6)
         tk.Button(g_row2, text="Set", command=self._set_position,
                   font=FONT_BTN_SM, bg="#45475a", fg="white", relief="flat", width=6).pack(side="left")
-        g_row3 = tk.Frame(gripper_frame, bg=BG_CARD)
-        g_row3.pack(fill="x", padx=8, pady=(4, 8))
-        tk.Label(g_row3, text="Impedance:", font=FONT_LABEL, bg=BG_CARD, fg=FG).pack(side="left")
-        self._imp_btn = tk.Button(
-            g_row3, text="OFF", width=8, bg="#e74c3c", fg="white",
-            font=FONT_BTN_SM, relief="flat", command=self._toggle_impedance,
-        )
-        self._imp_btn.pack(side="left", padx=6)
-
         # Training (수집된 데이터셋 기준 오프라인 학습 — 별도 프로세스로 실행)
         train_frame = ttk.LabelFrame(left, text="Training (offline)", style="Card.TLabelframe")
         train_frame.pack(fill="x", padx=4, pady=5)
@@ -571,16 +548,31 @@ class ControlPanel:
                         hsv = _cv2.cvtColor(bgr, _cv2.COLOR_BGR2HSV)
 
                         # 노랑 마스크 → cyan overlay (좌우 15% 배제)
+                        # Multi Pivot 체크 시: 멀티 pivot 서보잉/추론에 실제로 적용되는
+                        # yellow_roi_scale=0.5(중심 기준 가로/세로 절반)를 그대로 시각화.
                         # mask_y = _cv2.inRange(hsv, _np.array([22, 150, 120]), _np.array([32, 255, 255]))  # 기존 노란색 기준
                         mask_y = _cv2.inRange(hsv, _np.array([10, 150, 120]), _np.array([26, 255, 255]))
                         mask_y = _cv2.erode(mask_y, None, iterations=2)
                         mask_y = _cv2.dilate(mask_y, None, iterations=2)
-                        y_left  = int(w * 0.15)
-                        y_right = int(w * 0.85)
+                        _multi_pivot_on = bool(self._vla_bool_vars.get("multi_pivot") and
+                                               self._vla_bool_vars["multi_pivot"].get())
+                        if _multi_pivot_on:
+                            y_roi_scale = 0.5
+                            y_left  = int(w * (0.5 - (0.5 - 0.15) * y_roi_scale))
+                            y_right = int(w * (0.5 + (0.85 - 0.5) * y_roi_scale))
+                            y_top_v = int(h * (0.5 - 0.5 * y_roi_scale))
+                            y_bot_v = int(h * (0.5 + 0.5 * y_roi_scale))
+                        else:
+                            y_left  = int(w * 0.15)
+                            y_right = int(w * 0.85)
+                            y_top_v = 0
+                            y_bot_v = h - 1
+                        mask_y[:y_top_v, :]  = 0
+                        mask_y[y_bot_v:, :]  = 0
                         mask_y[:, :y_left]  = 0
                         mask_y[:, y_right:] = 0
                         vis[mask_y > 0] = (0, 200, 200)
-                        _cv2.rectangle(vis, (y_left, 0), (y_right, h - 1), (0, 200, 200), 1)
+                        _cv2.rectangle(vis, (y_left, y_top_v), (y_right, y_bot_v), (0, 200, 200), 1)
 
                         # 케이블(검정) 마스크 → blue overlay, ROI 내부만
                         top_y   = int(h * 0.51)
@@ -919,15 +911,6 @@ class ControlPanel:
             except ValueError:
                 pass
 
-    def _toggle_unwrap_rotvec(self):
-        enabled = self._unwrap_rotvec_var.get()
-        if self._set_unwrap_rotvec_fn is None:
-            return
-        try:
-            self._set_unwrap_rotvec_fn(enabled)
-        except Exception as e:
-            print(f"[Orientation] 오류: {e}")
-
     def _toggle_admittance(self):
         turning_on = not self._admittance_on
         fn = self._admittance_on_fn if turning_on else self._admittance_off_fn
@@ -942,16 +925,6 @@ class ControlPanel:
                 self._adm_btn.config(text="○  Admittance OFF", bg="#e74c3c")
         except Exception as e:
             print(f"[Admittance] 오류: {e}")
-
-    def _toggle_impedance(self):
-        if self._gripper:
-            if self._impedance_on:
-                self._gripper.impedance_off()
-                self._imp_btn.config(text="OFF", bg="#e74c3c")
-            else:
-                self._gripper.impedance_on()
-                self._imp_btn.config(text="ON", bg="#2ecc71")
-            self._impedance_on = not self._impedance_on
 
     def run(self):
         self._root.mainloop()
